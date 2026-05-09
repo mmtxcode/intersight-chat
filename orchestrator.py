@@ -10,12 +10,24 @@ Python changes needed.
 from __future__ import annotations
 
 import json
+import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from openai import OpenAI
 
 from mcp_client import IntersightMCPClient, ToolSpec
+
+
+# Keep models pinned in VRAM between turns so consecutive prompts don't pay
+# the model-load cost. Ollama's default is 5 minutes.
+KEEP_ALIVE = "24h"
+
+
+def _log(msg: str) -> None:
+    """Emit timing diagnostics to stderr; surfaces in `make logs`."""
+    print(f"[orchestrator] {msg}", file=sys.stderr, flush=True)
 
 
 SYSTEM_PROMPT = """\
@@ -88,7 +100,14 @@ MAX_REPEAT_CALLS = 3
 class TurnEvent:
     """Streamed during a turn so the UI can show progress."""
 
-    kind: str  # "tool_call" | "tool_result" | "assistant_text" | "error"
+    # "round_start"     — beginning of a new model-call round; UI should clear
+    #                     any in-progress assistant text from the previous round
+    # "assistant_delta" — incremental text token from a streaming completion
+    # "tool_call"       — model issued a tool call
+    # "tool_result"     — tool returned (or errored)
+    # "assistant_text"  — final assistant text for the turn (authoritative)
+    # "error"           — turn aborted with a user-visible error
+    kind: str
     name: str = ""
     arguments: dict[str, Any] | None = None
     result_preview: str = ""
@@ -179,15 +198,49 @@ class Orchestrator:
 
         tool_defs = mcp_tools_to_openai_schema(self.mcp.list_tools())
         recent_call_signatures: list[str] = []
+        turn_started = time.perf_counter()
 
-        for _ in range(MAX_TOOL_ROUNDS):
+        for round_idx in range(MAX_TOOL_ROUNDS):
+            emit(TurnEvent(kind="round_start"))
+
+            round_started = time.perf_counter()
+            content_buf = ""
+            tool_calls_acc: dict[int, dict[str, str]] = {}
+            first_token_at: float | None = None
+
             try:
-                completion = self.client.chat.completions.create(
+                stream = self.client.chat.completions.create(
                     model=model,
                     messages=messages,
                     tools=tool_defs if tool_defs else None,
                     tool_choice="auto" if tool_defs else None,
+                    stream=True,
+                    extra_body={"keep_alive": KEEP_ALIVE},
                 )
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+
+                    if getattr(delta, "content", None):
+                        if first_token_at is None:
+                            first_token_at = time.perf_counter()
+                        content_buf += delta.content
+                        emit(TurnEvent(kind="assistant_delta", text=delta.content))
+
+                    for tc_delta in (getattr(delta, "tool_calls", None) or []):
+                        idx = tc_delta.index
+                        slot = tool_calls_acc.setdefault(
+                            idx, {"id": "", "name": "", "arguments": ""}
+                        )
+                        if tc_delta.id:
+                            slot["id"] = tc_delta.id
+                        fn = getattr(tc_delta, "function", None)
+                        if fn is not None:
+                            if fn.name:
+                                slot["name"] = fn.name
+                            if fn.arguments:
+                                slot["arguments"] += fn.arguments
             except Exception as exc:
                 msg = f"Ollama call failed: {exc}"
                 emit(TurnEvent(kind="error", text=msg, is_error=True))
@@ -195,38 +248,52 @@ class Orchestrator:
                 record.final_text = msg
                 return msg, record
 
-            choice = completion.choices[0]
-            assistant_msg = choice.message
-            tool_calls = getattr(assistant_msg, "tool_calls", None) or []
+            completion_elapsed = time.perf_counter() - round_started
+            ttft = (
+                f"{first_token_at - round_started:.2f}s"
+                if first_token_at is not None
+                else "n/a"
+            )
+            _log(
+                f"round={round_idx} model_call elapsed={completion_elapsed:.2f}s "
+                f"ttft={ttft} content_chars={len(content_buf)} "
+                f"tool_calls={len(tool_calls_acc)}"
+            )
 
-            if not tool_calls:
-                final_text = assistant_msg.content or ""
-                emit(TurnEvent(kind="assistant_text", text=final_text))
-                history.append({"role": "assistant", "content": final_text})
-                record.final_text = final_text
-                return final_text, record
+            # No tool calls means the model is done — content_buf is the final answer.
+            if not tool_calls_acc:
+                emit(TurnEvent(kind="assistant_text", text=content_buf))
+                history.append({"role": "assistant", "content": content_buf})
+                record.final_text = content_buf
+                _log(
+                    f"turn complete elapsed={time.perf_counter() - turn_started:.2f}s "
+                    f"rounds={round_idx + 1}"
+                )
+                return content_buf, record
 
+            sorted_tcs = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())]
             assistant_history_entry: dict[str, Any] = {
                 "role": "assistant",
-                "content": assistant_msg.content or "",
+                "content": content_buf,
                 "tool_calls": [
                     {
-                        "id": tc.id,
+                        "id": tc["id"],
                         "type": "function",
                         "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments or "{}",
+                            "name": tc["name"],
+                            "arguments": tc["arguments"] or "{}",
                         },
                     }
-                    for tc in tool_calls
+                    for tc in sorted_tcs
                 ],
             }
             messages.append(assistant_history_entry)
             history.append(assistant_history_entry)
 
-            for tc in tool_calls:
-                tool_name = tc.function.name
-                args = _safe_parse_arguments(tc.function.arguments)
+            for tc in sorted_tcs:
+                tool_name = tc["name"]
+                tool_id = tc["id"]
+                args = _safe_parse_arguments(tc["arguments"])
 
                 # Loop detection: same tool + same args repeated MAX_REPEAT_CALLS
                 # times in a row is the model stuck. Cut it off with a clear note.
@@ -251,6 +318,7 @@ class Orchestrator:
 
                 emit(TurnEvent(kind="tool_call", name=tool_name, arguments=args))
 
+                tool_started = time.perf_counter()
                 if tool_name in HIDDEN_TOOLS:
                     result_text = json.dumps(
                         {"ok": False, "error": f"Tool {tool_name} is not available to the model."}
@@ -266,6 +334,11 @@ class Orchestrator:
                     except Exception as exc:
                         result_text = json.dumps({"ok": False, "error": str(exc)})
                         is_error = True
+                tool_elapsed = time.perf_counter() - tool_started
+                _log(
+                    f"round={round_idx} tool={tool_name} elapsed={tool_elapsed:.2f}s "
+                    f"result_chars={len(result_text)} is_error={is_error}"
+                )
 
                 emit(
                     TurnEvent(
@@ -278,7 +351,7 @@ class Orchestrator:
 
                 tool_msg = {
                     "role": "tool",
-                    "tool_call_id": tc.id,
+                    "tool_call_id": tool_id,
                     "content": result_text,
                 }
                 messages.append(tool_msg)

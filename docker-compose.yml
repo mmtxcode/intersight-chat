@@ -11,6 +11,11 @@ services:
       # Host port is configurable — set OLLAMA_HOST_PORT in .env if 11434
       # is already taken (e.g. Ollama is running natively on the host).
       - "${OLLAMA_HOST_PORT:-11434}:11434"
+    environment:
+      # Keep loaded models pinned in VRAM so consecutive prompts skip the
+      # model-load cost. Default is 5m. The orchestrator also passes this
+      # per-request, but setting it here covers everything.
+      OLLAMA_KEEP_ALIVE: 24h
     volumes:
       # Persist downloaded models across restarts. `docker compose down -v`
       # wipes them.

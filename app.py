@@ -282,9 +282,20 @@ def handle_user_message(prompt: str) -> None:
     with st.chat_message("assistant"):
         status_box = st.status("Thinking…", expanded=False)
         text_placeholder = st.empty()
+        # Buffer for the streamed assistant text. Cleared at the start of each
+        # tool-calling round so only the final round's text survives in the slot.
+        text_buf: list[str] = []
 
         def on_event(ev: TurnEvent) -> None:
-            if ev.kind == "tool_call":
+            if ev.kind == "round_start":
+                text_buf.clear()
+                text_placeholder.empty()
+            elif ev.kind == "assistant_delta":
+                text_buf.append(ev.text)
+                text_placeholder.markdown("".join(text_buf) + "▌")
+            elif ev.kind == "assistant_text":
+                text_placeholder.markdown(ev.text)
+            elif ev.kind == "tool_call":
                 status_box.update(
                     label=f"Querying Intersight: {ev.name}…", state="running"
                 )
