@@ -1,22 +1,19 @@
 SHELL := /bin/bash
 COMPOSE ?= docker compose
-MODEL ?= llama3.1
+MODEL ?= qwen2.5:14b
 
 .PHONY: up up-gpu down restart logs ps build pull-model shell-app shell-ollama clean
 
-## Bring the stack up (CPU). Works on any Docker host. First run also builds the app image.
+## Bring the stack up (CPU only). Works on any Docker host. For GPU servers,
+## use `make up-gpu` instead.
 up:
 	$(COMPOSE) up -d --build
 
 ## Bring the stack up with NVIDIA GPU passthrough for Ollama.
-## Requires the NVIDIA Container Toolkit on the host.
+## Requires the NVIDIA Container Toolkit on the host. This is the recommended
+## target for production / lab GPU servers.
 up-gpu:
 	$(COMPOSE) -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
-
-## Run only the app container; reuse an Ollama instance already on the host.
-## Use this when port 11434 is taken because Ollama is running natively.
-up-host-ollama:
-	$(COMPOSE) -f docker-compose.yml -f docker-compose.host-ollama.yml up -d --build app
 
 ## Stop and remove containers (keeps the model volume).
 down:
