@@ -1,0 +1,26 @@
+.env
+.env.local
+.env.*.local
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+mcp-server/node_modules/
+mcp-server/dist/
+
+# Credential / secret files — never commit these
+*.pem
+*.key
+id_rsa*
+*.p12
+*.pfx
+.streamlit/secrets.toml
+
+# Local tooling state
+.claude/
+.DS_Store
+.idea/
+.vscode/
+
+# Misc
+*.log

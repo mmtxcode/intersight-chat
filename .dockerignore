@@ -1,0 +1,19 @@
+.git
+.gitignore
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pem
+README.md
+.claude/
+.streamlit/secrets.toml
+
+# Don't ship local builds — they're rebuilt inside the image
+mcp-server/node_modules/
+mcp-server/dist/
+
+# Node/Python tooling output
+*.log
+.DS_Store
