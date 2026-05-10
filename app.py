@@ -11,6 +11,7 @@ import atexit
 import dataclasses
 import json
 import os
+import threading
 from datetime import datetime
 from typing import Any
 
@@ -87,6 +88,42 @@ def init_state() -> None:
     ss.setdefault("credentials_configured", False)
     ss.setdefault("connection_status", None)
     ss.setdefault("mask_key_id", True)
+    ss.setdefault("warmed_model", None)
+
+
+# ---------------------------------------------------------------- model pre-warm
+
+def _ollama_native_base() -> str:
+    """Strip the OpenAI-compat `/v1` suffix off OLLAMA_BASE_URL."""
+    base = OLLAMA_BASE_URL.rstrip("/")
+    return base[:-3] if base.endswith("/v1") else base
+
+
+def prewarm_model_async(model: str) -> None:
+    """Kick off model loading in a daemon thread.
+
+    Sends an empty generation to Ollama's native /api/generate with
+    keep_alive=24h, which loads the model into VRAM and pins it. The first
+    user prompt then skips the ~30s cold-load cost. Best-effort: failures
+    (Ollama still booting, network blip, etc.) are silent — the user's
+    first prompt just pays the load cost normally.
+
+    Ollama dedupes loads internally, so re-firing this against an
+    already-loaded model is a fast no-op.
+    """
+    url = f"{_ollama_native_base()}/api/generate"
+
+    def _run() -> None:
+        try:
+            requests.post(
+                url,
+                json={"model": model, "prompt": "", "keep_alive": "24h"},
+                timeout=180,
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ---------------------------------------------------------------- credentials
@@ -696,6 +733,14 @@ def main() -> None:
         st.stop()
 
     render_sidebar()
+
+    # Pre-warm the selected model into VRAM in the background so the user's
+    # first prompt doesn't pay the cold-load cost (~30s for qwen2.5:14b on
+    # an L40S). Fires once per (session, model) — Ollama dedupes anyway.
+    ss = st.session_state
+    if ss.selected_model and ss.selected_model != ss.warmed_model:
+        prewarm_model_async(ss.selected_model)
+        ss.warmed_model = ss.selected_model
 
     st.title("🛰️ Intersight Chat")
     st.caption(
