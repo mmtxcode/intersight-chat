@@ -3,3 +3,7 @@ openai>=1.40.0
 mcp>=1.0.0
 requests>=2.32.0
 python-dotenv>=1.0.0
+# PDF download for assistant messages (markdown -> styled HTML -> PDF).
+# Both pure-Python wheels; no system libs required (unlike weasyprint).
+markdown>=3.5
+xhtml2pdf>=0.2.16

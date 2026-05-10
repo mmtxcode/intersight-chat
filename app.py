@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import atexit
 import dataclasses
+import io
 import json
 import os
+from datetime import datetime
 from typing import Any
 
 import requests
@@ -293,6 +295,79 @@ def render_metrics_caption(metrics: dict[str, Any] | TurnMetrics | None) -> None
     st.caption(" · ".join(parts))
 
 
+@st.cache_data(show_spinner=False, max_entries=200)
+def _markdown_to_pdf_bytes(text: str) -> bytes:
+    """Render assistant markdown to a styled PDF.
+
+    Cached on the markdown text so re-rendering chat history (which happens
+    on every Streamlit rerun) doesn't re-generate the same PDF. Imports are
+    inside the function to keep app startup snappy when no one ever clicks.
+    """
+    import markdown as md
+    from xhtml2pdf import pisa
+
+    body = md.markdown(text, extensions=["fenced_code", "tables", "nl2br"])
+    html = f"""<html><head><meta charset="utf-8"><style>
+      @page {{ size: letter; margin: 0.75in; }}
+      body {{ font-family: Helvetica, Arial, sans-serif; font-size: 11pt; line-height: 1.45; color: #1a1a1a; }}
+      h1, h2, h3, h4 {{ color: #14365d; margin: 12pt 0 6pt 0; }}
+      h1 {{ font-size: 18pt; }}
+      h2 {{ font-size: 14pt; }}
+      h3 {{ font-size: 12pt; }}
+      h4 {{ font-size: 11pt; }}
+      p  {{ margin: 6pt 0; }}
+      ul, ol {{ margin: 6pt 0 6pt 16pt; }}
+      code {{ background: #f4f4f4; padding: 1pt 4pt; font-family: Courier, monospace; font-size: 10pt; }}
+      pre  {{ background: #f4f4f4; padding: 8pt; font-family: Courier, monospace; font-size: 9pt; white-space: pre-wrap; }}
+      table {{ border-collapse: collapse; margin: 8pt 0; }}
+      th, td {{ border: 1px solid #ccc; padding: 4pt 8pt; font-size: 10pt; }}
+      th {{ background: #eaeaea; }}
+      blockquote {{ border-left: 3pt solid #ccc; margin: 8pt 0; padding: 0 0 0 10pt; color: #555; }}
+    </style></head><body>{body}</body></html>"""
+    buf = io.BytesIO()
+    result = pisa.CreatePDF(html, dest=buf, encoding="utf-8")
+    if result.err:
+        raise RuntimeError(f"xhtml2pdf reported {result.err} errors")
+    return buf.getvalue()
+
+
+def render_pdf_button(text: str, key: str) -> None:
+    """Download-as-PDF button for an assistant message.
+
+    Uses Streamlit's native download_button (lives in the main page context,
+    so downloads always work — no iframe sandbox quirks). PDF generation is
+    cached, so the first render of a message pays ~100-300ms and every
+    rerun after that is instant.
+    """
+    if not text:
+        return
+    try:
+        pdf_bytes = _markdown_to_pdf_bytes(text)
+    except Exception as exc:
+        st.caption(f"PDF unavailable ({exc})")
+        return
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    st.download_button(
+        "📄 PDF",
+        data=pdf_bytes,
+        file_name=f"intersight-{ts}.pdf",
+        mime="application/pdf",
+        key=f"pdf-{key}",
+        use_container_width=True,
+    )
+
+
+def render_action_buttons(text: str, key: str) -> None:
+    """Row of per-message actions (Copy, Download PDF, …)."""
+    if not text:
+        return
+    cols = st.columns([1, 1, 8])
+    with cols[0]:
+        render_copy_button(text)
+    with cols[1]:
+        render_pdf_button(text, key=key)
+
+
 def render_copy_button(text: str) -> None:
     """Small "Copy" button under an assistant message.
 
@@ -356,7 +431,7 @@ def render_copy_button(text: str) -> None:
 
 
 def render_chat_history() -> None:
-    for msg in st.session_state.display:
+    for i, msg in enumerate(st.session_state.display):
         role = msg["role"]
         with st.chat_message(role):
             if role == "assistant":
@@ -367,7 +442,7 @@ def render_chat_history() -> None:
                 st.markdown(content)
             if role == "assistant":
                 render_metrics_caption(msg.get("metrics"))
-                render_copy_button(content)
+                render_action_buttons(content, key=f"hist-{i}")
 
 
 def handle_user_message(prompt: str) -> None:
@@ -439,7 +514,7 @@ def handle_user_message(prompt: str) -> None:
 
         text_placeholder.markdown(final_text)
         render_metrics_caption(record.metrics)
-        render_copy_button(final_text)
+        render_action_buttons(final_text, key=f"live-{len(ss.display)}")
 
     ss.display.append(
         {
