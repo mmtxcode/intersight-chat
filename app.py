@@ -8,6 +8,7 @@ Run with:
 from __future__ import annotations
 
 import atexit
+import dataclasses
 import json
 import os
 from typing import Any
@@ -17,7 +18,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from mcp_client import IntersightMCPClient, default_client_from_env
-from orchestrator import Orchestrator, TurnEvent
+from orchestrator import Orchestrator, TurnEvent, TurnMetrics
 
 load_dotenv()
 
@@ -250,6 +251,47 @@ def render_tool_call_block(tc: dict[str, Any]) -> None:
             st.code(preview)
 
 
+def render_metrics_caption(metrics: dict[str, Any] | TurnMetrics | None) -> None:
+    """One-line performance summary under an assistant turn.
+
+    Accepts either a live `TurnMetrics` (from the orchestrator) or a dict
+    (from `st.session_state.display` after a Streamlit rerun, where the
+    metrics have been serialized via `dataclasses.asdict`).
+    """
+    if metrics is None:
+        return
+    if isinstance(metrics, TurnMetrics):
+        completion_tokens = metrics.completion_tokens
+        prompt_tokens = metrics.prompt_tokens
+        total_seconds = metrics.total_seconds
+        rounds = metrics.rounds
+        ctx_max = metrics.ctx_max
+        rate = metrics.tok_per_s
+    else:
+        completion_tokens = metrics.get("completion_tokens", 0)
+        prompt_tokens = metrics.get("prompt_tokens", 0)
+        total_seconds = metrics.get("total_seconds", 0.0)
+        rounds = metrics.get("rounds", 0)
+        ctx_max = metrics.get("ctx_max")
+        ms = metrics.get("model_seconds", 0.0)
+        rate = (completion_tokens / ms) if ms > 0 and completion_tokens > 0 else None
+
+    # Skip the caption entirely if Ollama didn't return usage (older versions).
+    if completion_tokens <= 0:
+        return
+
+    parts = [f"⚡ {total_seconds:.1f}s"]
+    if rate is not None:
+        parts.append(f"{rate:.0f} tok/s")
+    if ctx_max:
+        parts.append(f"{prompt_tokens:,} / {ctx_max:,} ctx")
+    elif prompt_tokens:
+        parts.append(f"{prompt_tokens:,} ctx")
+    if rounds > 1:
+        parts.append(f"{rounds} rounds")
+    st.caption(" · ".join(parts))
+
+
 def render_chat_history() -> None:
     for msg in st.session_state.display:
         role = msg["role"]
@@ -260,6 +302,8 @@ def render_chat_history() -> None:
             content = msg.get("content", "")
             if content:
                 st.markdown(content)
+            if role == "assistant":
+                render_metrics_caption(msg.get("metrics"))
 
 
 def handle_user_message(prompt: str) -> None:
@@ -330,12 +374,14 @@ def handle_user_message(prompt: str) -> None:
             status_box.update(label="Done", state="complete")
 
         text_placeholder.markdown(final_text)
+        render_metrics_caption(record.metrics)
 
     ss.display.append(
         {
             "role": "assistant",
             "content": final_text,
             "tool_calls": tool_calls_for_display,
+            "metrics": dataclasses.asdict(record.metrics),
         }
     )
 

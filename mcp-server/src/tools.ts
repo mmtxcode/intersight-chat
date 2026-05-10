@@ -222,7 +222,10 @@ export const tools: ToolDefinition[] = [
     description:
       "List chassis inventory. Each chassis has a NumSlots field (total slot count) " +
       "and a Moid you can join with compute Blades' Chassis.Moid to compute slot occupancy.",
-    endpoint: "/api/v1/equipment/Chassis",
+    // Intersight uses the irregular plural `Chasses` for this endpoint (verified
+    // against CiscoDevNet/intersight-python's equipment_api.py). The MO type is
+    // still `equipment.Chassis` and the field name on Blades is still `Chassis.Moid`.
+    endpoint: "/api/v1/equipment/Chasses",
     defaultSelect: [
       "Name",
       "Moid",

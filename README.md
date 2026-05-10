@@ -150,7 +150,7 @@ The MCP server exposes these tools to the model:
 | `get_server_profiles` | `GET /api/v1/server/Profiles` |
 | `get_server_profile_by_name` | `GET /api/v1/server/Profiles?$filter=Name eq '…'` |
 | `get_physical_servers` | `GET /api/v1/compute/PhysicalSummaries` |
-| `get_chassis` | `GET /api/v1/equipment/Chassis` |
+| `get_chassis` | `GET /api/v1/equipment/Chasses` |
 | `get_compute_blades` | `GET /api/v1/compute/Blades` |
 | `get_compute_rack_units` | `GET /api/v1/compute/RackUnits` |
 | `get_fabric_interconnects` | `GET /api/v1/network/Elements` |

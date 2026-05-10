@@ -116,11 +116,37 @@ class TurnEvent:
 
 
 @dataclass
+class TurnMetrics:
+    """Per-turn performance numbers shown in the UI and logs.
+
+    `model_seconds` is the wall time spent inside model_call rounds
+    (sum across rounds), distinct from `total_seconds` which also covers
+    tool execution and Streamlit overhead. `prompt_tokens` is the LAST
+    round's prompt size — that's the peak context usage for the turn,
+    after every tool result has been folded back into the messages.
+    """
+
+    total_seconds: float = 0.0
+    model_seconds: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    rounds: int = 0
+    ctx_max: int | None = None
+
+    @property
+    def tok_per_s(self) -> float | None:
+        if self.model_seconds > 0 and self.completion_tokens > 0:
+            return self.completion_tokens / self.model_seconds
+        return None
+
+
+@dataclass
 class TurnRecord:
     """Persisted on the message in chat history so the sidebar can replay it."""
 
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     final_text: str = ""
+    metrics: TurnMetrics = field(default_factory=TurnMetrics)
 
 
 def mcp_tools_to_openai_schema(tools: Iterable[ToolSpec]) -> list[dict[str, Any]]:
@@ -169,6 +195,39 @@ class Orchestrator:
     ) -> None:
         self.mcp = mcp_client
         self.client = OpenAI(base_url=ollama_base_url, api_key=ollama_api_key)
+        # Stored separately so we can hit Ollama's native /api/show endpoint
+        # for context-length metadata. The OpenAI-compat endpoint doesn't
+        # expose that.
+        self._ollama_base_url = ollama_base_url
+        self._ctx_cache: dict[str, int | None] = {}
+
+    def _get_model_context_max(self, model: str) -> int | None:
+        """Return the model's max context length, or None on failure.
+
+        Hits Ollama's `/api/show` once per model and caches the result.
+        Used for the demo metrics caption in the UI.
+        """
+        if model in self._ctx_cache:
+            return self._ctx_cache[model]
+        api_base = self._ollama_base_url.rstrip("/")
+        if api_base.endswith("/v1"):
+            api_base = api_base[:-3]
+        try:
+            import httpx  # transitive dep of openai
+
+            with httpx.Client(timeout=5.0) as c:
+                r = c.post(f"{api_base}/api/show", json={"name": model})
+                r.raise_for_status()
+                data = r.json()
+            info = data.get("model_info") or {}
+            for k, v in info.items():
+                if k.endswith(".context_length"):
+                    self._ctx_cache[model] = int(v)
+                    return self._ctx_cache[model]
+        except Exception as exc:
+            _log(f"context_length lookup failed for {model}: {exc}")
+        self._ctx_cache[model] = None
+        return None
 
     def run_turn(
         self,
@@ -199,6 +258,11 @@ class Orchestrator:
         tool_defs = mcp_tools_to_openai_schema(self.mcp.list_tools())
         recent_call_signatures: list[str] = []
         turn_started = time.perf_counter()
+        metrics = record.metrics
+        metrics.ctx_max = self._get_model_context_max(model)
+
+        def _finalize() -> None:
+            metrics.total_seconds = time.perf_counter() - turn_started
 
         for round_idx in range(MAX_TOOL_ROUNDS):
             emit(TurnEvent(kind="round_start"))
@@ -208,6 +272,7 @@ class Orchestrator:
             tool_calls_acc: dict[int, dict[str, str]] = {}
             first_token_at: float | None = None
 
+            last_usage = None
             try:
                 stream = self.client.chat.completions.create(
                     model=model,
@@ -215,9 +280,14 @@ class Orchestrator:
                     tools=tool_defs if tool_defs else None,
                     tool_choice="auto" if tool_defs else None,
                     stream=True,
+                    stream_options={"include_usage": True},
                     extra_body={"keep_alive": KEEP_ALIVE},
                 )
                 for chunk in stream:
+                    # The usage chunk arrives at the end with an empty `choices`
+                    # list, so capture it before the early-continue below.
+                    if getattr(chunk, "usage", None):
+                        last_usage = chunk.usage
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
@@ -246,6 +316,7 @@ class Orchestrator:
                 emit(TurnEvent(kind="error", text=msg, is_error=True))
                 history.append({"role": "assistant", "content": msg})
                 record.final_text = msg
+                _finalize()
                 return msg, record
 
             completion_elapsed = time.perf_counter() - round_started
@@ -254,10 +325,19 @@ class Orchestrator:
                 if first_token_at is not None
                 else "n/a"
             )
+            metrics.model_seconds += completion_elapsed
+            metrics.rounds += 1
+            if last_usage is not None:
+                # prompt_tokens grows each round as tool results are folded
+                # back into messages, so the last round is the peak.
+                metrics.prompt_tokens = last_usage.prompt_tokens
+                metrics.completion_tokens += last_usage.completion_tokens
             _log(
                 f"round={round_idx} model_call elapsed={completion_elapsed:.2f}s "
                 f"ttft={ttft} content_chars={len(content_buf)} "
-                f"tool_calls={len(tool_calls_acc)}"
+                f"tool_calls={len(tool_calls_acc)} "
+                f"prompt_tokens={last_usage.prompt_tokens if last_usage else '?'} "
+                f"completion_tokens={last_usage.completion_tokens if last_usage else '?'}"
             )
 
             # No tool calls means the model is done — content_buf is the final answer.
@@ -265,9 +345,17 @@ class Orchestrator:
                 emit(TurnEvent(kind="assistant_text", text=content_buf))
                 history.append({"role": "assistant", "content": content_buf})
                 record.final_text = content_buf
+                _finalize()
+                rate_str = (
+                    f"{metrics.tok_per_s:.1f}"
+                    if metrics.tok_per_s is not None
+                    else "n/a"
+                )
                 _log(
-                    f"turn complete elapsed={time.perf_counter() - turn_started:.2f}s "
-                    f"rounds={round_idx + 1}"
+                    f"turn complete elapsed={metrics.total_seconds:.2f}s "
+                    f"rounds={metrics.rounds} "
+                    f"completion_tokens={metrics.completion_tokens} "
+                    f"tok_per_s={rate_str}"
                 )
                 return content_buf, record
 
@@ -314,6 +402,7 @@ class Orchestrator:
                     emit(TurnEvent(kind="error", text=msg, is_error=True))
                     history.append({"role": "assistant", "content": msg})
                     record.final_text = msg
+                    _finalize()
                     return msg, record
 
                 emit(TurnEvent(kind="tool_call", name=tool_name, arguments=args))
@@ -373,4 +462,5 @@ class Orchestrator:
         emit(TurnEvent(kind="error", text=msg, is_error=True))
         history.append({"role": "assistant", "content": msg})
         record.final_text = msg
+        _finalize()
         return msg, record
