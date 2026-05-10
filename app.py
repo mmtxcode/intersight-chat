@@ -526,6 +526,147 @@ def handle_user_message(prompt: str) -> None:
     )
 
 
+# ---------------------------------------------------------------- presets
+
+INVENTORY_REPORT_PROMPT = """\
+Generate a comprehensive infrastructure inventory report for an Intersight
+administrator. The audience is an engineer who manages and supports
+Intersight, so the report should help answer "what do I have, what state is
+it in, and what needs attention" at a glance.
+
+Gather data using these tools (use defaults; pass top=200 if you suspect
+truncation):
+- get_chassis
+- get_compute_blades
+- get_compute_rack_units
+- get_fabric_interconnects
+- get_alarm_summary
+- get_hcl_status
+- get_server_profiles
+
+Then produce a markdown report with the following structure. Use # for the
+title, ## for sections, ### for subsections. Use markdown tables (pipe
+syntax) for tabular data. Be concise — favor bullets and tables, not prose.
+
+# Intersight Inventory Report
+
+## Executive Summary
+A bulleted overview with the headline numbers:
+- Total servers: blades + rack units, with each subtotal
+- Power state: how many On vs Off (use OperPowerState on blades and the
+  equivalent on rack units; fall back to AdminPowerState if needed)
+- Operational health: count by state (Operable/Healthy, Warning/Degraded,
+  Inoperable/Critical, Other)
+- Total chassis and total slots used vs available
+- Fabric interconnects total
+- Server profiles: assigned vs unassigned
+- Active alarms by severity
+- HCL compliance counts
+
+## Servers
+
+### By power state
+A markdown table with columns: State | Count | %.
+
+### By operational state
+A markdown table with columns: State | Count | %.
+
+### Top server models
+A markdown table of the top 5 models by count: Model | Count.
+
+### Servers needing attention
+Any server whose OperState is not Operable/Healthy. Table:
+Name | Model | OperState | PowerState | Chassis (or "N/A" for rack units).
+If none, write "All servers are healthy."
+
+## Chassis
+A table per chassis: Name | Model | OperState | Total Slots | Slots Used |
+Slots Free. Compute Slots Used as the count of blades whose Chassis.Moid
+matches this chassis's Moid (you have to join the blades data to the
+chassis data yourself). Slots Free = Total Slots − Slots Used. Sort by
+chassis name.
+
+If there are no chassis (rack-only environment), write
+"No chassis present (rack-only environment)."
+
+## Fabric Interconnects
+A table: Name | Model | Serial | OperState. If none, say so.
+
+## Server Profiles
+- Total: <X>
+- Assigned: <X> (profiles with a non-empty AssignedServer reference)
+- Unassigned: <X>
+
+If 10 or fewer unassigned, list them by name in a sub-bullet. Otherwise
+give the count and the first 10 names.
+
+## Active Alarms
+A bullet list of counts per severity from get_alarm_summary. If no active
+alarms, write "No active alarms."
+
+## HCL Compliance
+A bullet list of counts per HCL status from get_hcl_status (Validated,
+Incomplete, Not-Validated, Not-Listed, etc.). If get_hcl_status returns
+nothing, write "HCL data unavailable."
+
+---
+
+Format rules:
+- Use markdown tables (pipe syntax) for all tabular data — never prose.
+- Round percentages to whole numbers.
+- If a tool returns no data, write "None" or "0" rather than omitting the
+  whole section.
+- Do NOT add a "Summary" or "Conclusion" section at the end — the executive
+  summary at the top is sufficient.
+"""
+
+
+PRESET_PROMPTS: dict[str, str] = {
+    "📦 Inventory Report": INVENTORY_REPORT_PROMPT,
+}
+
+
+def render_preset_chips() -> None:
+    """Row of preset-prompt chips just above the chat input.
+
+    Click queues the preset's prompt in session state and triggers a rerun;
+    main() picks it up and feeds it through the same handle_user_message
+    path as a typed prompt. Disabled until the user has selected a model
+    and entered credentials, so clicks don't fall through to a confusing
+    "pick a model" error.
+    """
+    if not PRESET_PROMPTS:
+        return
+
+    ss = st.session_state
+    ready = bool(ss.selected_model) and credentials_ready()
+    help_text = (
+        None
+        if ready
+        else "Pick a model and add Intersight credentials in the sidebar "
+        "to enable presets."
+    )
+
+    # Lay out chips left-aligned with a spacer column so they take their
+    # natural width on wide screens instead of stretching across the page.
+    n = len(PRESET_PROMPTS)
+    chip_w = 3
+    spacer_w = max(1, 12 - chip_w * n)
+    cols = st.columns([chip_w] * n + [spacer_w])
+
+    for (label, preset_prompt), col in zip(PRESET_PROMPTS.items(), cols):
+        with col:
+            if st.button(
+                label,
+                key=f"preset-{label}",
+                use_container_width=True,
+                disabled=not ready,
+                help=help_text,
+            ):
+                ss.queued_prompt = preset_prompt
+                st.rerun()
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> None:
@@ -557,6 +698,15 @@ def main() -> None:
         )
 
     render_chat_history()
+
+    # Run any prompt queued by a preset chip on the previous rerun. This
+    # appends user + assistant messages to the chat in the natural document
+    # flow, so they appear directly under the existing chat history.
+    queued = st.session_state.pop("queued_prompt", None)
+    if queued:
+        handle_user_message(queued)
+
+    render_preset_chips()
 
     prompt = st.chat_input("Ask about your Intersight environment…")
     if prompt:
