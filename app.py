@@ -15,6 +15,7 @@ from typing import Any
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 from mcp_client import IntersightMCPClient, default_client_from_env
@@ -292,6 +293,68 @@ def render_metrics_caption(metrics: dict[str, Any] | TurnMetrics | None) -> None
     st.caption(" · ".join(parts))
 
 
+def render_copy_button(text: str) -> None:
+    """Small "Copy" button under an assistant message.
+
+    Streamlit strips inline event handlers from `st.markdown(...,
+    unsafe_allow_html=True)`, so the button has to live inside an iframe
+    via `components.html`. We try the modern Clipboard API first and fall
+    back to `document.execCommand('copy')` so this also works when the app
+    is served over plain HTTP (Clipboard API requires a secure context —
+    HTTPS or localhost).
+    """
+    if not text:
+        return
+    # `</` inside a JS string literal would close the surrounding <script>
+    # tag, so escape it before embedding the JSON.
+    payload = json.dumps(text).replace("</", "<\\/")
+    html = f"""
+    <div style="margin:2px 0 0 0">
+      <button id="cp" type="button" style="
+        background: transparent;
+        border: 1px solid rgba(128,128,128,0.25);
+        border-radius: 6px;
+        padding: 3px 10px;
+        font-size: 12px;
+        cursor: pointer;
+        color: rgba(140,140,140,1);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      ">📋 Copy</button>
+    </div>
+    <script>
+      const TEXT = {payload};
+      const btn = document.getElementById("cp");
+      btn.addEventListener("click", () => {{
+        const flash = (ok) => {{
+          const orig = btn.innerText;
+          btn.innerText = ok ? "✓ Copied" : "× Failed";
+          setTimeout(() => {{ btn.innerText = orig; }}, 1500);
+        }};
+        const fallback = () => {{
+          const ta = document.createElement("textarea");
+          ta.value = TEXT;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          let ok = false;
+          try {{ ok = document.execCommand("copy"); }} catch (e) {{}}
+          document.body.removeChild(ta);
+          flash(ok);
+        }};
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+          navigator.clipboard.writeText(TEXT)
+            .then(() => flash(true))
+            .catch(() => fallback());
+        }} else {{
+          fallback();
+        }}
+      }});
+    </script>
+    """
+    components.html(html, height=32)
+
+
 def render_chat_history() -> None:
     for msg in st.session_state.display:
         role = msg["role"]
@@ -304,6 +367,7 @@ def render_chat_history() -> None:
                 st.markdown(content)
             if role == "assistant":
                 render_metrics_caption(msg.get("metrics"))
+                render_copy_button(content)
 
 
 def handle_user_message(prompt: str) -> None:
@@ -375,6 +439,7 @@ def handle_user_message(prompt: str) -> None:
 
         text_placeholder.markdown(final_text)
         render_metrics_caption(record.metrics)
+        render_copy_button(final_text)
 
     ss.display.append(
         {
