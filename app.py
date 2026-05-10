@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import atexit
 import dataclasses
-import io
 import json
 import os
 from datetime import datetime
@@ -295,40 +294,55 @@ def render_metrics_caption(metrics: dict[str, Any] | TurnMetrics | None) -> None
     st.caption(" · ".join(parts))
 
 
+_DEJAVU_DIR = "/usr/share/fonts/truetype/dejavu"
+
+
 @st.cache_data(show_spinner=False, max_entries=200)
 def _markdown_to_pdf_bytes(text: str) -> bytes:
-    """Render assistant markdown to a styled PDF.
+    """Render assistant markdown to PDF using fpdf2.
 
-    Cached on the markdown text so re-rendering chat history (which happens
-    on every Streamlit rerun) doesn't re-generate the same PDF. Imports are
-    inside the function to keep app startup snappy when no one ever clicks.
+    Pure-Python — no native deps. fpdf2's write_html supports the markdown
+    subset we care about (headings, paragraphs, lists, tables, emphasis,
+    code spans). Cached on the markdown text so re-rendering chat history
+    on every Streamlit rerun doesn't re-pay generation cost.
+
+    We prefer DejaVu Sans (installed via fonts-dejavu-core in the Docker
+    image) for full Unicode coverage, and fall back to fpdf2's built-in
+    Helvetica core font when running outside Docker on a host without the
+    font (e.g. local dev). In the Helvetica fallback we strip non-Latin-1
+    chars so write_html doesn't choke on em-dashes, smart quotes, etc.
     """
     import markdown as md
-    from xhtml2pdf import pisa
+    from fpdf import FPDF
 
-    body = md.markdown(text, extensions=["fenced_code", "tables", "nl2br"])
-    html = f"""<html><head><meta charset="utf-8"><style>
-      @page {{ size: letter; margin: 0.75in; }}
-      body {{ font-family: Helvetica, Arial, sans-serif; font-size: 11pt; line-height: 1.45; color: #1a1a1a; }}
-      h1, h2, h3, h4 {{ color: #14365d; margin: 12pt 0 6pt 0; }}
-      h1 {{ font-size: 18pt; }}
-      h2 {{ font-size: 14pt; }}
-      h3 {{ font-size: 12pt; }}
-      h4 {{ font-size: 11pt; }}
-      p  {{ margin: 6pt 0; }}
-      ul, ol {{ margin: 6pt 0 6pt 16pt; }}
-      code {{ background: #f4f4f4; padding: 1pt 4pt; font-family: Courier, monospace; font-size: 10pt; }}
-      pre  {{ background: #f4f4f4; padding: 8pt; font-family: Courier, monospace; font-size: 9pt; white-space: pre-wrap; }}
-      table {{ border-collapse: collapse; margin: 8pt 0; }}
-      th, td {{ border: 1px solid #ccc; padding: 4pt 8pt; font-size: 10pt; }}
-      th {{ background: #eaeaea; }}
-      blockquote {{ border-left: 3pt solid #ccc; margin: 8pt 0; padding: 0 0 0 10pt; color: #555; }}
-    </style></head><body>{body}</body></html>"""
-    buf = io.BytesIO()
-    result = pisa.CreatePDF(html, dest=buf, encoding="utf-8")
-    if result.err:
-        raise RuntimeError(f"xhtml2pdf reported {result.err} errors")
-    return buf.getvalue()
+    body_html = md.markdown(text, extensions=["fenced_code", "tables", "nl2br"])
+    # fpdf2's HTML renderer doesn't draw table borders unless asked.
+    body_html = body_html.replace("<table>", '<table border="1">')
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    regular = os.path.join(_DEJAVU_DIR, "DejaVuSans.ttf")
+    bold = os.path.join(_DEJAVU_DIR, "DejaVuSans-Bold.ttf")
+    italic = os.path.join(_DEJAVU_DIR, "DejaVuSans-Oblique.ttf")
+    bold_italic = os.path.join(_DEJAVU_DIR, "DejaVuSans-BoldOblique.ttf")
+
+    if os.path.exists(regular):
+        pdf.add_font("DejaVu", "", regular)
+        if os.path.exists(bold):
+            pdf.add_font("DejaVu", "B", bold)
+        if os.path.exists(italic):
+            pdf.add_font("DejaVu", "I", italic)
+        if os.path.exists(bold_italic):
+            pdf.add_font("DejaVu", "BI", bold_italic)
+        pdf.set_font("DejaVu", size=11)
+    else:
+        pdf.set_font("Helvetica", size=11)
+        body_html = body_html.encode("latin-1", errors="replace").decode("latin-1")
+
+    pdf.write_html(body_html)
+    return bytes(pdf.output())
 
 
 def render_pdf_button(text: str, key: str) -> None:

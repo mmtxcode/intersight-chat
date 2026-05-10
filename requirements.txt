@@ -3,7 +3,9 @@ openai>=1.40.0
 mcp>=1.0.0
 requests>=2.32.0
 python-dotenv>=1.0.0
-# PDF download for assistant messages (markdown -> styled HTML -> PDF).
-# Both pure-Python wheels; no system libs required (unlike weasyprint).
+# PDF download for assistant messages (markdown -> HTML -> PDF).
+# Both pure-Python wheels with no native deps. xhtml2pdf would have given
+# nicer output but transitively needs pycairo, which has no Linux wheel and
+# requires gcc + libcairo2-dev to build — not worth the image bloat.
 markdown>=3.5
-xhtml2pdf>=0.2.16
+fpdf2>=2.7.9

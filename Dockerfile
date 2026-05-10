@@ -17,10 +17,13 @@ RUN npm run build
 FROM python:3.12-slim AS runtime
 
 # Node.js 20 — the Python app spawns the MCP server as a stdio child process.
+# fonts-dejavu-core gives the Download-PDF action a Unicode-capable font
+# (~3 MB) so chat output with em-dashes, smart quotes, and common symbols
+# renders correctly instead of falling back to "?".
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get install -y --no-install-recommends nodejs fonts-dejavu-core \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
