@@ -188,19 +188,6 @@ def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None)
         f"alarm_buckets={len(alarms_raw)} hcl={len(hcl)}"
     )
 
-    # Diagnostic: dump the field names of the first item from each resource
-    # type that we have to join on. If the chassis-ref field on blades is
-    # under a name we haven't included in the MCP server's defaultSelect,
-    # trimResults will have stripped it and the slot-utilization join will
-    # silently fail. Surfacing the keys lets us confirm (or correct) which
-    # field name to use without having to dump full payloads.
-    if chassis:
-        _log(f"first chassis keys: {sorted(chassis[0].keys())}")
-    if blades:
-        _log(f"first blade keys: {sorted(blades[0].keys())}")
-    if pcie_nodes:
-        _log(f"first pcie_node keys: {sorted(pcie_nodes[0].keys())}")
-
     # ---- Aggregations
     all_servers = list(blades) + list(rack_units)
     total = len(all_servers)
