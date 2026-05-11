@@ -368,13 +368,20 @@ def _markdown_to_pdf_bytes(text: str) -> bytes:
     bold_italic = os.path.join(_DEJAVU_DIR, "DejaVuSans-BoldOblique.ttf")
 
     if os.path.exists(regular):
+        # Register all four style slots fpdf2 may switch into. If a variant
+        # file is missing (e.g. fonts-dejavu-extra not installed), fall back
+        # to the regular file under that slot so emphasis renders in regular
+        # weight instead of crashing with "Undefined font: dejavuI". Bold
+        # falls back to bold-or-regular, bold-italic to bold-or-regular.
         pdf.add_font("DejaVu", "", regular)
-        if os.path.exists(bold):
-            pdf.add_font("DejaVu", "B", bold)
-        if os.path.exists(italic):
-            pdf.add_font("DejaVu", "I", italic)
-        if os.path.exists(bold_italic):
-            pdf.add_font("DejaVu", "BI", bold_italic)
+        pdf.add_font("DejaVu", "B", bold if os.path.exists(bold) else regular)
+        pdf.add_font("DejaVu", "I", italic if os.path.exists(italic) else regular)
+        pdf.add_font(
+            "DejaVu",
+            "BI",
+            bold_italic if os.path.exists(bold_italic)
+            else (bold if os.path.exists(bold) else regular),
+        )
         pdf.set_font("DejaVu", size=11)
     else:
         pdf.set_font("Helvetica", size=11)
