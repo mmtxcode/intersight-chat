@@ -188,6 +188,13 @@ def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None)
         f"alarm_buckets={len(alarms_raw)} hcl={len(hcl)}"
     )
 
+    # One-shot diagnostic: dump the first FI's populated (non-empty) fields
+    # so we can find which key holds the hostname the user sees in the
+    # Intersight UI. Remove once the FI display-name fallback chain is right.
+    if fis:
+        sample = {k: v for k, v in fis[0].items() if v not in (None, "", [], {})}
+        _log(f"first fi populated fields: {json.dumps(sample, default=str)[:1500]}")
+
     # ---- Aggregations
     all_servers = list(blades) + list(rack_units)
     total = len(all_servers)
