@@ -278,6 +278,28 @@ export const tools: ToolDefinition[] = [
   }),
 
   listTool({
+    name: "get_pci_nodes",
+    description:
+      "List PCIe nodes (pci.Node MOs, e.g., UCSX-440P GPU nodes in X-Series " +
+      "chassis). PCIe nodes occupy chassis slots just like blades but do NOT " +
+      "reference a chassis directly — they reference their paired blade via " +
+      "ComputeBlade (with Parent as a fallback). To compute true slot " +
+      "occupancy, join pci.Node -> compute.Blade -> equipment.Chassis. The " +
+      "total used slots in a chassis is the count of blades PLUS the count " +
+      "of PCIe nodes whose paired blade lives in that chassis.",
+    endpoint: "/api/v1/pci/Nodes",
+    defaultSelect: [
+      "Name",
+      "Moid",
+      "Model",
+      "SlotId",
+      "ComputeBlade",
+      "Parent",
+      "ObjectType",
+    ],
+  }),
+
+  listTool({
     name: "get_fabric_interconnects",
     description: "List fabric interconnects (network elements).",
     endpoint: "/api/v1/network/Elements",

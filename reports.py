@@ -131,6 +131,17 @@ _HEALTHY_OPER_STATES = {
 }
 
 
+# Total slots per chassis model. Intersight does NOT expose total slot count
+# on equipment.Chassis (NumSlots is often empty or 0 for X-Series), so we keep
+# our own table here. If a chassis model isn't in this table, slot math falls
+# back to NumSlots (if present) then to the highest SlotId observed across
+# the fleet. Extend this table as new chassis models are encountered.
+KNOWN_CAPACITY = {
+    "UCSX-9508":     8,   # X-Series chassis
+    "UCSB-5108-AC2": 8,   # B-Series chassis (8 half-width or 4 full-width)
+}
+
+
 def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None) -> dict[str, Any]:
     """Pull every Intersight resource needed for the inventory report and
     roll the raw data into a compact summary dict.
@@ -155,6 +166,11 @@ def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None)
     blades = _call_tool(mcp, "get_compute_blades", {"top": 500, "select": BLADE_SELECT})
     step("Querying rack servers…")
     rack_units = _call_tool(mcp, "get_compute_rack_units", {"top": 500, "select": RACK_SELECT})
+    step("Querying PCIe nodes…")
+    # X-Series PCIe nodes (e.g. UCSX-440P) occupy chassis slots but don't
+    # reference a chassis directly — they reference their paired blade via
+    # ComputeBlade. Two-hop join: pci.Node -> compute.Blade -> chassis.
+    pcie_nodes = _call_tool(mcp, "get_pci_nodes", {"top": 500})
     step("Querying fabric interconnects…")
     fis = _call_tool(mcp, "get_fabric_interconnects", {"top": 200})
     step("Querying server profiles…")
@@ -166,7 +182,8 @@ def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None)
 
     _log(
         f"inventory gather: chassis={len(chassis)} blades={len(blades)} "
-        f"rack_units={len(rack_units)} fis={len(fis)} profiles={len(profiles)} "
+        f"rack_units={len(rack_units)} pcie_nodes={len(pcie_nodes)} "
+        f"fis={len(fis)} profiles={len(profiles)} "
         f"alarm_buckets={len(alarms_raw)} hcl={len(hcl)}"
     )
 
@@ -174,26 +191,97 @@ def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None)
     all_servers = list(blades) + list(rack_units)
     total = len(all_servers)
 
-    # blade → chassis Moid for slot-occupancy join
-    slots_used = Counter()
+    # ---- Slot-occupancy join (blades + PCIe nodes).
+    #
+    # 1. Blades reference a chassis directly. Modern Intersight uses
+    #    `EquipmentChassis`; older payloads use `Chassis`. Check both.
+    # 2. PCIe nodes (UCSX-440P etc.) do NOT reference a chassis directly.
+    #    They reference their paired blade via `ComputeBlade` (with `Parent`
+    #    as a fallback). Two-hop join: PCIe node -> blade -> chassis.
+    # 3. Both types share the same physical slot pool, so used = blades + PCIe.
+    def _ref_moid(item: dict[str, Any], *keys: str) -> str | None:
+        for k in keys:
+            ref = item.get(k)
+            if isinstance(ref, dict) and ref.get("Moid"):
+                return ref["Moid"]
+        return None
+
+    blades_per_chassis: Counter[str] = Counter()
+    blade_to_chassis: dict[str, str] = {}
     for b in blades:
-        ch_ref = b.get("Chassis")
-        moid = ch_ref.get("Moid") if isinstance(ch_ref, dict) else None
-        if moid:
-            slots_used[moid] += 1
+        chassis_moid = _ref_moid(b, "EquipmentChassis", "Chassis")
+        if chassis_moid:
+            blades_per_chassis[chassis_moid] += 1
+            blade_moid = b.get("Moid")
+            if blade_moid:
+                blade_to_chassis[blade_moid] = chassis_moid
+
+    pcie_per_chassis: Counter[str] = Counter()
+    for node in pcie_nodes:
+        # Resolve PCIe node -> paired blade -> chassis.
+        paired_blade_moid = _ref_moid(node, "ComputeBlade", "Parent")
+        chassis_moid = blade_to_chassis.get(paired_blade_moid) if paired_blade_moid else None
+        if chassis_moid:
+            pcie_per_chassis[chassis_moid] += 1
+
+    # Capacity per chassis model: KNOWN_CAPACITY first (authoritative), then
+    # NumSlots from the chassis MO (often missing for X-Series, hence the
+    # table), then highest observed SlotId for that model in the fleet as a
+    # last-resort lower bound.
+    observed_max_slot: dict[str, int] = {}
+    for c in chassis:
+        model = c.get("Model") or "Unknown"
+        moid = c.get("Moid")
+        # Walk every occupant of this chassis. SlotId is int on blades and
+        # str on PCIe nodes — coerce defensively.
+        occupant_slots: list[int] = []
+        for b in blades:
+            if _ref_moid(b, "EquipmentChassis", "Chassis") == moid:
+                try:
+                    occupant_slots.append(int(b.get("SlotId") or 0))
+                except (TypeError, ValueError):
+                    pass
+        for node in pcie_nodes:
+            paired = _ref_moid(node, "ComputeBlade", "Parent")
+            if blade_to_chassis.get(paired) == moid:
+                try:
+                    occupant_slots.append(int(node.get("SlotId") or 0))
+                except (TypeError, ValueError):
+                    pass
+        if occupant_slots:
+            observed_max_slot[model] = max(
+                observed_max_slot.get(model, 0), max(occupant_slots)
+            )
+
+    def _capacity_for(model: str, num_slots_field: int) -> int:
+        if model in KNOWN_CAPACITY:
+            return KNOWN_CAPACITY[model]
+        if num_slots_field > 0:
+            return num_slots_field
+        return observed_max_slot.get(model, 0)
 
     chassis_rows = []
     for c in chassis:
         moid = c.get("Moid")
-        num_slots = int(c.get("NumSlots") or 0)
-        used = slots_used.get(moid, 0)
+        model = c.get("Model") or "Unknown"
+        num_slots_field = int(c.get("NumSlots") or 0)
+        blade_count = blades_per_chassis.get(moid, 0)
+        pcie_count = pcie_per_chassis.get(moid, 0)
+        used = blade_count + pcie_count
+        total = _capacity_for(model, num_slots_field)
+        # Defensive: if reality exceeds our table, trust reality.
+        if total and used > total:
+            total = used
         chassis_rows.append({
             "name": c.get("Name") or "(unnamed)",
-            "model": c.get("Model") or "Unknown",
+            "model": model,
             "oper_state": c.get("OperState") or "Unknown",
-            "num_slots": num_slots,
+            "num_slots": total,
             "slots_used": used,
-            "slots_free": max(num_slots - used, 0),
+            "slots_used_blades": blade_count,
+            "slots_used_pcie": pcie_count,
+            "slots_free": max(total - used, 0) if total else 0,
+            "capacity_known": total > 0,
         })
     chassis_rows.sort(key=lambda x: x["name"])
 
@@ -260,7 +348,10 @@ def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None)
             "rows": chassis_rows,
             "total_slots": sum(r["num_slots"] for r in chassis_rows),
             "slots_used": sum(r["slots_used"] for r in chassis_rows),
+            "slots_used_blades": sum(r["slots_used_blades"] for r in chassis_rows),
+            "slots_used_pcie": sum(r["slots_used_pcie"] for r in chassis_rows),
             "slots_free": sum(r["slots_free"] for r in chassis_rows),
+            "any_unknown_capacity": any(not r["capacity_known"] for r in chassis_rows),
         },
         "fabric_interconnects": {
             "total": len(fi_rows),
@@ -303,7 +394,7 @@ from the JSON data above. No commentary, no preamble, no sign-off.
 - **Servers:** {total} total ({blades} blades, {rack_units} rack units)
 - **Power state:** {power_summary}
 - **Health:** {health_summary}
-- **Chassis:** {chassis_total} chassis with {slots_used}/{total_slots} slots used ({slots_free} free)
+- **Chassis:** {chassis_total} chassis with {slots_used}/{total_slots} slots used ({slots_free} free; {slots_used_blades} blades + {slots_used_pcie} PCIe nodes)
 - **Fabric interconnects:** {fi_total}
 - **Server profiles:** {assigned}/{profile_total} assigned ({unassigned} unassigned)
 - **Active alarms:** {alarms_summary}
@@ -327,8 +418,14 @@ the single line: **All servers are healthy.**
 
 ## Chassis
 If `chassis.total` > 0, render `chassis.rows` as a markdown table with
-columns: Name | Model | OperState | Total Slots | Slots Used | Slots Free.
-Otherwise write the single line: **No chassis present (rack-only environment).**
+columns: Name | Model | OperState | Total Slots | Blades | PCIe Nodes |
+Slots Free. The Blades column comes from `slots_used_blades`, PCIe Nodes
+from `slots_used_pcie`. Both occupy chassis slots; their sum is `slots_used`.
+If `chassis.any_unknown_capacity` is true, add this italic line under the
+table: *Total Slots = "0" indicates the chassis model isn't in the
+KNOWN_CAPACITY table; extend reports.py to fix.*
+Otherwise (no chassis at all), write the single line:
+**No chassis present (rack-only environment).**
 
 ## Fabric Interconnects
 If `fabric_interconnects.total` > 0, render `fabric_interconnects.rows` as a
@@ -387,6 +484,8 @@ def format_inventory_prompt(data: dict[str, Any]) -> str:
         health_summary=health_summary,
         chassis_total=c["total"],
         slots_used=c["slots_used"],
+        slots_used_blades=c["slots_used_blades"],
+        slots_used_pcie=c["slots_used_pcie"],
         total_slots=c["total_slots"],
         slots_free=c["slots_free"],
         fi_total=data["fabric_interconnects"]["total"],

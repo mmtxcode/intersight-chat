@@ -153,6 +153,7 @@ The MCP server exposes these tools to the model:
 | `get_chassis` | `GET /api/v1/equipment/Chasses` |
 | `get_compute_blades` | `GET /api/v1/compute/Blades` |
 | `get_compute_rack_units` | `GET /api/v1/compute/RackUnits` |
+| `get_pci_nodes` | `GET /api/v1/pci/Nodes` |
 | `get_fabric_interconnects` | `GET /api/v1/network/Elements` |
 | `get_alarms` | `GET /api/v1/cond/Alarms` |
 | `get_alarm_summary` | `GET /api/v1/cond/Alarms?$apply=groupby((Severity)…)` |
