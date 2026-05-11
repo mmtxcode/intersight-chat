@@ -153,19 +153,20 @@ def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None)
         if progress is not None:
             progress(label)
 
-    # The default $select for get_compute_blades / get_compute_rack_units
-    # does NOT include OperState (the health field), so we override it
-    # explicitly. Without this the operational-state table would be 100%
-    # "Unknown" because the field would be absent from every row.
-    BLADE_SELECT = "Name,Moid,Model,Chassis,OperState,OperPowerState"
-    RACK_SELECT = "Name,Moid,Model,OperState,OperPowerState"
-
+    # NOTE: do NOT pass an explicit `select` for blades or rack units. The
+    # MCP server's default-select path fetches the full response and trims
+    # in Python, which preserves the `Chassis` reference's nested `Moid` so
+    # the blade -> chassis join works. An explicit `$select=Chassis` against
+    # the live API returns a stripped reference shape without `Moid`, which
+    # silently breaks the join (every chassis shows 0 used). OperState is
+    # now in the MCP server's defaultSelect for both blades and rack units,
+    # so we don't need a custom select to surface it either.
     step("Querying chassis…")
     chassis = _call_tool(mcp, "get_chassis", {"top": 200})
     step("Querying blade servers…")
-    blades = _call_tool(mcp, "get_compute_blades", {"top": 500, "select": BLADE_SELECT})
+    blades = _call_tool(mcp, "get_compute_blades", {"top": 500})
     step("Querying rack servers…")
-    rack_units = _call_tool(mcp, "get_compute_rack_units", {"top": 500, "select": RACK_SELECT})
+    rack_units = _call_tool(mcp, "get_compute_rack_units", {"top": 500})
     step("Querying PCIe nodes…")
     # X-Series PCIe nodes (e.g. UCSX-440P) occupy chassis slots but don't
     # reference a chassis directly — they reference their paired blade via
