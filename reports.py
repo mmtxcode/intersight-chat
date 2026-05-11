@@ -303,9 +303,28 @@ def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None)
                 "chassis": ch_name or "N/A",
             })
 
+    def _fi_display_name(fi: dict[str, Any]) -> str:
+        """Best-effort identifier for a fabric interconnect.
+
+        The admin-configured Name is often empty; in that case fall back to
+        Hostname, then to a synthesized 'FI-A' / 'FI-B' from Switchid (which
+        is reliably populated), and finally to the Dn. Returns '(unnamed)'
+        only when none of those are present.
+        """
+        if fi.get("Name"):
+            return fi["Name"]
+        if fi.get("Hostname"):
+            return fi["Hostname"]
+        switchid = fi.get("Switchid")
+        if switchid:
+            return f"FI-{switchid}"
+        if fi.get("Dn"):
+            return fi["Dn"]
+        return "(unnamed)"
+
     fi_rows = [
         {
-            "name": f.get("Name") or "(unnamed)",
+            "name": _fi_display_name(f),
             "model": f.get("Model") or "Unknown",
             "serial": f.get("Serial") or "",
             "oper_state": f.get("OperState") or "Unknown",

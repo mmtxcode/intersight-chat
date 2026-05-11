@@ -313,10 +313,16 @@ export const tools: ToolDefinition[] = [
 
   listTool({
     name: "get_fabric_interconnects",
-    description: "List fabric interconnects (network elements).",
+    description:
+      "List fabric interconnects (network elements). The admin-configured " +
+      "Name is often empty — when it is, identify the FI by Switchid " +
+      "(always 'A' or 'B', commonly referred to as 'FI-A' / 'FI-B'), " +
+      "Hostname, or Dn (e.g., 'sys/switch-A'), in that order of preference.",
     endpoint: "/api/v1/network/Elements",
     defaultSelect: [
       "Name",
+      "Hostname",
+      "Dn",
       "Moid",
       "Serial",
       "Model",
