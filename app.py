@@ -12,6 +12,7 @@ import dataclasses
 import json
 import os
 import threading
+import time
 from datetime import datetime
 from typing import Any
 
@@ -22,6 +23,7 @@ from dotenv import load_dotenv
 
 from mcp_client import IntersightMCPClient, default_client_from_env
 from orchestrator import Orchestrator, TurnEvent, TurnMetrics
+from reports import FORMATTER_SYSTEM_PROMPT, PRESET_REPORTS, ReportSpec
 
 load_dotenv()
 
@@ -577,116 +579,19 @@ def handle_user_message(prompt: str) -> None:
     )
 
 
-# ---------------------------------------------------------------- presets
-
-INVENTORY_REPORT_PROMPT = """\
-Generate a comprehensive infrastructure inventory report for an Intersight
-administrator. The audience is an engineer who manages and supports
-Intersight, so the report should help answer "what do I have, what state is
-it in, and what needs attention" at a glance.
-
-Gather data using these tools (use defaults; pass top=200 if you suspect
-truncation):
-- get_chassis
-- get_compute_blades
-- get_compute_rack_units
-- get_fabric_interconnects
-- get_alarm_summary
-- get_hcl_status
-- get_server_profiles
-
-Then produce a markdown report with the following structure. Use # for the
-title, ## for sections, ### for subsections. Use markdown tables (pipe
-syntax) for tabular data. Be concise — favor bullets and tables, not prose.
-
-# Intersight Inventory Report
-
-## Executive Summary
-A bulleted overview with the headline numbers:
-- Total servers: blades + rack units, with each subtotal
-- Power state: how many On vs Off (use OperPowerState on blades and the
-  equivalent on rack units; fall back to AdminPowerState if needed)
-- Operational health: count by state (Operable/Healthy, Warning/Degraded,
-  Inoperable/Critical, Other)
-- Total chassis and total slots used vs available
-- Fabric interconnects total
-- Server profiles: assigned vs unassigned
-- Active alarms by severity
-- HCL compliance counts
-
-## Servers
-
-### By power state
-A markdown table with columns: State | Count | %.
-
-### By operational state
-A markdown table with columns: State | Count | %.
-
-### Top server models
-A markdown table of the top 5 models by count: Model | Count.
-
-### Servers needing attention
-Any server whose OperState is not Operable/Healthy. Table:
-Name | Model | OperState | PowerState | Chassis (or "N/A" for rack units).
-If none, write "All servers are healthy."
-
-## Chassis
-A table per chassis: Name | Model | OperState | Total Slots | Slots Used |
-Slots Free. Compute Slots Used as the count of blades whose Chassis.Moid
-matches this chassis's Moid (you have to join the blades data to the
-chassis data yourself). Slots Free = Total Slots − Slots Used. Sort by
-chassis name.
-
-If there are no chassis (rack-only environment), write
-"No chassis present (rack-only environment)."
-
-## Fabric Interconnects
-A table: Name | Model | Serial | OperState. If none, say so.
-
-## Server Profiles
-- Total: <X>
-- Assigned: <X> (profiles with a non-empty AssignedServer reference)
-- Unassigned: <X>
-
-If 10 or fewer unassigned, list them by name in a sub-bullet. Otherwise
-give the count and the first 10 names.
-
-## Active Alarms
-A bullet list of counts per severity from get_alarm_summary. If no active
-alarms, write "No active alarms."
-
-## HCL Compliance
-A bullet list of counts per HCL status from get_hcl_status (Validated,
-Incomplete, Not-Validated, Not-Listed, etc.). If get_hcl_status returns
-nothing, write "HCL data unavailable."
-
----
-
-Format rules:
-- Use markdown tables (pipe syntax) for all tabular data — never prose.
-- Round percentages to whole numbers.
-- If a tool returns no data, write "None" or "0" rather than omitting the
-  whole section.
-- Do NOT add a "Summary" or "Conclusion" section at the end — the executive
-  summary at the top is sufficient.
-"""
-
-
-PRESET_PROMPTS: dict[str, str] = {
-    "📦 Inventory Report": INVENTORY_REPORT_PROMPT,
-}
-
+# ---------------------------------------------------------------- preset chips
 
 def render_preset_chips() -> None:
-    """Row of preset-prompt chips just above the chat input.
+    """Row of preset-report chips just above the chat input.
 
-    Click queues the preset's prompt in session state and triggers a rerun;
-    main() picks it up and feeds it through the same handle_user_message
-    path as a typed prompt. Disabled until the user has selected a model
-    and entered credentials, so clicks don't fall through to a confusing
-    "pick a model" error.
+    Each chip maps to a ReportSpec in PRESET_REPORTS. Clicking one queues
+    the report's label in session state and triggers a rerun; main() picks
+    it up and routes through handle_preset_report (deterministic data
+    gather in Python → LLM formats the result). Disabled until the user
+    has selected a model and entered credentials, so clicks don't fall
+    through to a confusing "pick a model" error.
     """
-    if not PRESET_PROMPTS:
+    if not PRESET_REPORTS:
         return
 
     ss = st.session_state
@@ -700,12 +605,12 @@ def render_preset_chips() -> None:
 
     # Lay out chips left-aligned with a spacer column so they take their
     # natural width on wide screens instead of stretching across the page.
-    n = len(PRESET_PROMPTS)
+    n = len(PRESET_REPORTS)
     chip_w = 3
     spacer_w = max(1, 12 - chip_w * n)
     cols = st.columns([chip_w] * n + [spacer_w])
 
-    for (label, preset_prompt), col in zip(PRESET_PROMPTS.items(), cols):
+    for (label, _spec), col in zip(PRESET_REPORTS.items(), cols):
         with col:
             if st.button(
                 label,
@@ -714,8 +619,104 @@ def render_preset_chips() -> None:
                 disabled=not ready,
                 help=help_text,
             ):
-                ss.queued_prompt = preset_prompt
+                ss.queued_report = label
                 st.rerun()
+
+
+def handle_preset_report(spec: ReportSpec) -> None:
+    """Run a deterministic report: gather data in Python, then ask the LLM
+    only to format it as markdown.
+
+    Mirrors handle_user_message's UI shell (user bubble + assistant bubble
+    with streaming text, status box, metrics caption, Copy/PDF actions) so
+    the result blends into chat history like any other turn.
+    """
+    ss = st.session_state
+
+    if not ss.selected_model:
+        st.error("Pick a model in the sidebar first.")
+        return
+    if not credentials_ready():
+        st.error("Configure your Intersight Key ID and PEM in the sidebar first.")
+        return
+
+    ss.display.append({"role": "user", "content": spec.user_message})
+    with st.chat_message("user"):
+        st.markdown(spec.user_message)
+
+    orchestrator = get_orchestrator()
+    mcp = get_mcp_client()
+
+    with st.chat_message("assistant"):
+        status_box = st.status("Preparing report…", expanded=False)
+        text_placeholder = st.empty()
+        text_buf: list[str] = []
+
+        # Phase 1 — Python gathers Intersight data deterministically.
+        gather_started = time.perf_counter()
+
+        def progress(label: str) -> None:
+            status_box.update(label=label, state="running")
+
+        try:
+            data = spec.gather(mcp, progress)
+        except Exception as exc:
+            status_box.update(label="Error", state="error")
+            st.error(f"Data gathering failed: {exc}")
+            return
+
+        gather_elapsed = time.perf_counter() - gather_started
+        status_box.update(
+            label=f"Formatting report ({gather_elapsed:.1f}s gathered)…",
+            state="running",
+        )
+
+        # Phase 2 — LLM formats the pre-computed data.
+        format_user_message = spec.format_prompt(data)
+
+        def on_event(ev: TurnEvent) -> None:
+            if ev.kind == "round_start":
+                text_buf.clear()
+                text_placeholder.empty()
+            elif ev.kind == "assistant_delta":
+                text_buf.append(ev.text)
+                text_placeholder.markdown("".join(text_buf) + "▌")
+            elif ev.kind == "assistant_text":
+                text_placeholder.markdown(ev.text)
+            elif ev.kind == "error":
+                status_box.update(label="Error", state="error")
+
+        try:
+            final_text, record = orchestrator.run_format_turn(
+                model=ss.selected_model,
+                history=ss.messages,
+                user_history_message=spec.user_message,
+                format_system_prompt=FORMATTER_SYSTEM_PROMPT,
+                format_user_message=format_user_message,
+                on_event=on_event,
+            )
+        except Exception as exc:
+            status_box.update(label="Error", state="error")
+            st.error(f"Format step failed: {exc}")
+            return
+
+        status_box.update(
+            label=f"Done — gathered in {gather_elapsed:.1f}s, formatted in "
+            f"{record.metrics.model_seconds:.1f}s",
+            state="complete",
+        )
+        text_placeholder.markdown(final_text)
+        render_metrics_caption(record.metrics)
+        render_action_buttons(final_text, key=f"live-{len(ss.display)}")
+
+    ss.display.append(
+        {
+            "role": "assistant",
+            "content": final_text,
+            "tool_calls": [],
+            "metrics": dataclasses.asdict(record.metrics),
+        }
+    )
 
 
 # ---------------------------------------------------------------- main
@@ -758,12 +759,14 @@ def main() -> None:
 
     render_chat_history()
 
-    # Run any prompt queued by a preset chip on the previous rerun. This
-    # appends user + assistant messages to the chat in the natural document
-    # flow, so they appear directly under the existing chat history.
-    queued = st.session_state.pop("queued_prompt", None)
-    if queued:
-        handle_user_message(queued)
+    # Run any preset-report queued by a chip click on the previous rerun.
+    # This appends user + assistant messages to the chat in the natural
+    # document flow, so they appear directly under the existing chat history.
+    queued_report_label = st.session_state.pop("queued_report", None)
+    if queued_report_label:
+        spec = PRESET_REPORTS.get(queued_report_label)
+        if spec is not None:
+            handle_preset_report(spec)
 
     render_preset_chips()
 

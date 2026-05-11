@@ -41,7 +41,7 @@ RUN cd mcp-server \
 COPY --from=mcp-builder /build/mcp-server/dist mcp-server/dist
 
 # Streamlit app
-COPY app.py mcp_client.py orchestrator.py ./
+COPY app.py mcp_client.py orchestrator.py reports.py ./
 
 EXPOSE 8501
 

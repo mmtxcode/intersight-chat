@@ -469,3 +469,116 @@ class Orchestrator:
         record.final_text = msg
         _finalize()
         return msg, record
+
+    def run_format_turn(
+        self,
+        *,
+        model: str,
+        history: list[dict[str, Any]],
+        user_history_message: str,
+        format_system_prompt: str,
+        format_user_message: str,
+        on_event: Callable[[TurnEvent], None] | None = None,
+    ) -> tuple[str, TurnRecord]:
+        """Single streaming completion with no tools — used by deterministic
+        report presets where Python has already gathered the data.
+
+        Two design choices worth flagging:
+
+        * The model call uses a standalone (system, user) message pair built
+          from `format_system_prompt` + `format_user_message`. We do NOT mix
+          in the existing chat history. That keeps the (potentially huge)
+          pre-computed JSON blob out of subsequent turns and lets us swap
+          the system prompt to a focused "you are a formatter" without
+          mutating chat state.
+        * Chat history gets a clean (user, assistant) pair: the short
+          `user_history_message` (e.g. "Generate an Intersight inventory
+          report.") and the model's formatted reply. So a follow-up turn
+          can reference the report by what's visible in the chat without
+          drowning in JSON.
+        """
+        record = TurnRecord()
+
+        def emit(event: TurnEvent) -> None:
+            if on_event is not None:
+                on_event(event)
+
+        # Keep the chat-history system prompt as-is (or insert the default
+        # if this is the very first turn). The format-only call uses its
+        # own (system, user) pair below.
+        if not history or history[0].get("role") != "system":
+            history.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        history.append({"role": "user", "content": user_history_message})
+
+        messages = [
+            {"role": "system", "content": format_system_prompt},
+            {"role": "user", "content": format_user_message},
+        ]
+
+        metrics = record.metrics
+        metrics.ctx_max = self._get_model_context_max(model)
+        turn_started = time.perf_counter()
+
+        emit(TurnEvent(kind="round_start"))
+        round_started = time.perf_counter()
+        content_buf = ""
+        first_token_at: float | None = None
+        last_usage = None
+
+        try:
+            stream = self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+                stream_options={"include_usage": True},
+                extra_body={"keep_alive": KEEP_ALIVE},
+            )
+            for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    last_usage = chunk.usage
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if getattr(delta, "content", None):
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                    content_buf += delta.content
+                    emit(TurnEvent(kind="assistant_delta", text=delta.content))
+        except Exception as exc:
+            msg = f"Ollama call failed: {exc}"
+            emit(TurnEvent(kind="error", text=msg, is_error=True))
+            history.append({"role": "assistant", "content": msg})
+            record.final_text = msg
+            metrics.total_seconds = time.perf_counter() - turn_started
+            return msg, record
+
+        completion_elapsed = time.perf_counter() - round_started
+        ttft = (
+            f"{first_token_at - round_started:.2f}s"
+            if first_token_at is not None
+            else "n/a"
+        )
+        metrics.model_seconds = completion_elapsed
+        metrics.rounds = 1
+        if last_usage is not None:
+            metrics.prompt_tokens = last_usage.prompt_tokens
+            metrics.completion_tokens = last_usage.completion_tokens
+        rate_str = (
+            f"{metrics.tok_per_s:.1f}"
+            if metrics.tok_per_s is not None
+            else "n/a"
+        )
+        _log(
+            f"format model_call elapsed={completion_elapsed:.2f}s ttft={ttft} "
+            f"content_chars={len(content_buf)} "
+            f"prompt_tokens={last_usage.prompt_tokens if last_usage else '?'} "
+            f"completion_tokens={last_usage.completion_tokens if last_usage else '?'} "
+            f"tok_per_s={rate_str}"
+        )
+
+        emit(TurnEvent(kind="assistant_text", text=content_buf))
+        history.append({"role": "assistant", "content": content_buf})
+        record.final_text = content_buf
+        metrics.total_seconds = time.perf_counter() - turn_started
+        _log(f"format turn complete elapsed={metrics.total_seconds:.2f}s")
+        return content_buf, record
