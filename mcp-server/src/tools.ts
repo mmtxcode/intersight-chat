@@ -220,8 +220,11 @@ export const tools: ToolDefinition[] = [
   listTool({
     name: "get_chassis",
     description:
-      "List chassis inventory. Each chassis has a NumSlots field (total slot count) " +
-      "and a Moid you can join with compute Blades' Chassis.Moid to compute slot occupancy.",
+      "List chassis inventory. Each chassis has a Moid you can join with " +
+      "compute Blades' EquipmentChassis.Moid (or Chassis.Moid for older " +
+      "payloads — check both) to compute slot occupancy. NumSlots is often " +
+      "empty for X-Series chassis; use known capacities by model when " +
+      "missing (UCSX-9508 = 8, UCSB-5108-AC2 = 8).",
     // Intersight uses the irregular plural `Chasses` for this endpoint (verified
     // against CiscoDevNet/intersight-python's equipment_api.py). The MO type is
     // still `equipment.Chassis` and the field name on Blades is still `Chassis.Moid`.
@@ -241,9 +244,11 @@ export const tools: ToolDefinition[] = [
   listTool({
     name: "get_compute_blades",
     description:
-      "List blade servers. Each blade has SlotId (its slot in the parent chassis) " +
-      "and a Chassis reference (Chassis.Moid). To compute available/free slots in a " +
-      "chassis: chassis.NumSlots minus the count of blades whose Chassis.Moid matches.",
+      "List blade servers. Each blade has SlotId (its slot in the parent " +
+      "chassis) and a chassis reference. Modern Intersight uses " +
+      "EquipmentChassis (canonical); older payloads use Chassis — check both. " +
+      "To compute available/free slots in a chassis: capacity minus the count " +
+      "of blades AND PCIe nodes (see get_pci_nodes) attached to that chassis.",
     endpoint: "/api/v1/compute/Blades",
     defaultSelect: [
       "Name",
@@ -251,6 +256,11 @@ export const tools: ToolDefinition[] = [
       "Serial",
       "Model",
       "SlotId",
+      // Both possible chassis-ref field names. Newer Intersight uses
+      // EquipmentChassis; some older payloads still use Chassis. Including
+      // both in defaultSelect means trimResults preserves whichever is
+      // populated — without it, the blade -> chassis join silently breaks.
+      "EquipmentChassis",
       "Chassis",
       "OperState",
       "OperPowerState",

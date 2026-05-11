@@ -72,9 +72,13 @@ DERIVED ANSWERS
       used = (blades in this chassis) + (PCIe nodes whose paired blade is
               in this chassis)
       free = total_slots − used
-  PCIe nodes do NOT reference a chassis directly — they reference their
-  paired blade via `ComputeBlade` (with `Parent` as a fallback). Two-hop
-  join: pci.Node -> compute.Blade -> equipment.Chassis. Call get_chassis,
+  Field names to use for the join:
+    * Blade -> chassis: blade.EquipmentChassis.Moid (canonical) or
+      blade.Chassis.Moid (older fallback) — check both.
+    * PCIe node -> blade: node.ComputeBlade.Moid (canonical) or
+      node.Parent.Moid (fallback) — check both.
+  PCIe nodes do NOT reference a chassis directly. Two-hop join:
+  pci.Node -> compute.Blade -> equipment.Chassis. Call get_chassis,
   get_compute_blades, AND get_pci_nodes, then do the arithmetic yourself.
 - Intersight does NOT always populate `NumSlots` on the chassis MO (often
   empty for X-Series). If NumSlots is 0 or missing, use known capacities
