@@ -19,11 +19,17 @@ To add a new report:
 from __future__ import annotations
 
 import json
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from mcp_client import IntersightMCPClient
+
+
+def _log(msg: str) -> None:
+    """Diagnostic logging surfaced in `make logs`."""
+    print(f"[reports] {msg}", file=sys.stderr, flush=True)
 
 
 # A tiny callback that the gather step calls between tools so the UI can
@@ -68,26 +74,38 @@ def _call_tool(
 ) -> list[dict[str, Any]]:
     """Call an MCP list-style tool and return its results array.
 
+    The Intersight MCP server wraps responses as:
+      {"ok": true, "status": 200, "data": {"Results": [...], ...}}
+    Errors come back as:
+      {"ok": false, "status": 4xx, "error": "...", "data": {...}}
+
     Returns an empty list on any error (tool failure, JSON parse failure,
-    unexpected shape). Report generation never blows up because one tool
-    happened to return nothing.
+    `ok: false`, unexpected shape) and logs a diagnostic line so blank
+    reports are easy to debug from `make logs`.
     """
     try:
         res = mcp.call_tool(name, args or {})
         if res.is_error or not res.text:
+            _log(f"{name}: tool error or empty response")
             return []
         parsed = json.loads(res.text)
-    except Exception:
+    except Exception as exc:
+        _log(f"{name}: call failed: {exc}")
         return []
-    if isinstance(parsed, list):
-        return parsed
-    if isinstance(parsed, dict):
-        if "results" in parsed and isinstance(parsed["results"], list):
-            return parsed["results"]
-        # Tools sometimes return a top-level error envelope rather than
-        # raising — treat those as "no data" for the report.
-        if parsed.get("ok") is False:
-            return []
+
+    if not isinstance(parsed, dict):
+        _log(f"{name}: unexpected top-level shape {type(parsed).__name__}")
+        return []
+    if parsed.get("ok") is False:
+        _log(f"{name}: ok=false error={parsed.get('error')!r}")
+        return []
+
+    data = parsed.get("data")
+    if isinstance(data, dict) and isinstance(data.get("Results"), list):
+        return data["Results"]
+    if isinstance(data, list):
+        return data
+    _log(f"{name}: no Results array in response (data keys: {list(data) if isinstance(data, dict) else type(data).__name__})")
     return []
 
 
@@ -124,12 +142,19 @@ def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None)
         if progress is not None:
             progress(label)
 
+    # The default $select for get_compute_blades / get_compute_rack_units
+    # does NOT include OperState (the health field), so we override it
+    # explicitly. Without this the operational-state table would be 100%
+    # "Unknown" because the field would be absent from every row.
+    BLADE_SELECT = "Name,Moid,Model,Chassis,OperState,OperPowerState"
+    RACK_SELECT = "Name,Moid,Model,OperState,OperPowerState"
+
     step("Querying chassis…")
     chassis = _call_tool(mcp, "get_chassis", {"top": 200})
     step("Querying blade servers…")
-    blades = _call_tool(mcp, "get_compute_blades", {"top": 500})
+    blades = _call_tool(mcp, "get_compute_blades", {"top": 500, "select": BLADE_SELECT})
     step("Querying rack servers…")
-    rack_units = _call_tool(mcp, "get_compute_rack_units", {"top": 500})
+    rack_units = _call_tool(mcp, "get_compute_rack_units", {"top": 500, "select": RACK_SELECT})
     step("Querying fabric interconnects…")
     fis = _call_tool(mcp, "get_fabric_interconnects", {"top": 200})
     step("Querying server profiles…")
@@ -138,6 +163,12 @@ def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None)
     alarms_raw = _call_tool(mcp, "get_alarm_summary", {})
     step("Querying HCL status…")
     hcl = _call_tool(mcp, "get_hcl_status", {"top": 500})
+
+    _log(
+        f"inventory gather: chassis={len(chassis)} blades={len(blades)} "
+        f"rack_units={len(rack_units)} fis={len(fis)} profiles={len(profiles)} "
+        f"alarm_buckets={len(alarms_raw)} hcl={len(hcl)}"
+    )
 
     # ---- Aggregations
     all_servers = list(blades) + list(rack_units)
