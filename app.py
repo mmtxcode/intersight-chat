@@ -8,6 +8,7 @@ Run with:
 from __future__ import annotations
 
 import atexit
+import base64
 import dataclasses
 import json
 import os
@@ -391,79 +392,87 @@ def _markdown_to_pdf_bytes(text: str) -> bytes:
     return bytes(pdf.output())
 
 
-def render_pdf_button(text: str, key: str) -> None:
-    """Download-as-PDF button for an assistant message.
+def render_action_buttons(text: str, key: str) -> None:
+    """Per-message action row: 📋 Copy + 📄 View PDF.
 
-    Uses Streamlit's native download_button (lives in the main page context,
-    so downloads always work — no iframe sandbox quirks). PDF generation is
-    cached, so the first render of a message pays ~100-300ms and every
-    rerun after that is instant.
+    Both buttons live in a single `components.html` iframe so they share
+    styling and lay out cleanly side-by-side. Each is JS-driven:
+
+      * Copy uses the Clipboard API with a `document.execCommand('copy')`
+        fallback so it also works over plain HTTP (Clipboard API requires
+        a secure context).
+      * View PDF builds a `Blob` from the cached PDF bytes (base64-decoded
+        in the iframe), calls `URL.createObjectURL`, and `window.open`s
+        the blob URL in a new tab — so the user sees the report rendered
+        in the browser's built-in PDF viewer, where they can save/print
+        from the viewer's toolbar. If the popup is blocked, we fall back
+        to a programmatic <a download> click so the user still gets the
+        file (just as a download instead of a view).
+
+    We used to render PDF via `st.download_button`, which is reliable but
+    always forces a download — no way to make it open in the viewer first.
+    The blob+window.open approach gives us that and only loses the safety
+    net for the (rare) popup-blocked case, which the JS fallback handles.
     """
     if not text:
         return
+
+    # PDF generation is cached on `text`, so re-rendering history is cheap.
+    pdf_b64: str
+    pdf_available: bool
     try:
         pdf_bytes = _markdown_to_pdf_bytes(text)
-    except Exception as exc:
-        st.caption(f"PDF unavailable ({exc})")
-        return
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+        pdf_available = True
+    except Exception as exc:  # noqa: BLE001 — surface failure as a label
+        _ = exc
+        pdf_b64 = ""
+        pdf_available = False
+
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    st.download_button(
-        "📄 PDF",
-        data=pdf_bytes,
-        file_name=f"intersight-{ts}.pdf",
-        mime="application/pdf",
-        key=f"pdf-{key}",
-        use_container_width=True,
-    )
+    filename = f"intersight-{ts}.pdf"
 
-
-def render_action_buttons(text: str, key: str) -> None:
-    """Row of per-message actions (Copy, Download PDF, …)."""
-    if not text:
-        return
-    cols = st.columns([1, 1, 8])
-    with cols[0]:
-        render_copy_button(text)
-    with cols[1]:
-        render_pdf_button(text, key=key)
-
-
-def render_copy_button(text: str) -> None:
-    """Small "Copy" button under an assistant message.
-
-    Streamlit strips inline event handlers from `st.markdown(...,
-    unsafe_allow_html=True)`, so the button has to live inside an iframe
-    via `components.html`. We try the modern Clipboard API first and fall
-    back to `document.execCommand('copy')` so this also works when the app
-    is served over plain HTTP (Clipboard API requires a secure context —
-    HTTPS or localhost).
-    """
-    if not text:
-        return
     # `</` inside a JS string literal would close the surrounding <script>
     # tag, so escape it before embedding the JSON.
-    payload = json.dumps(text).replace("</", "<\\/")
+    text_js = json.dumps(text).replace("</", "<\\/")
+    pdf_js = json.dumps(pdf_b64)
+    filename_js = json.dumps(filename)
+
+    btn_style = (
+        "background:transparent;"
+        "border:1px solid rgba(128,128,128,0.25);"
+        "border-radius:6px;"
+        "padding:3px 10px;"
+        "font-size:12px;"
+        "cursor:pointer;"
+        "color:rgba(140,140,140,1);"
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+    )
+    disabled_style = btn_style + "opacity:0.45;cursor:not-allowed;"
+
+    pdf_html = (
+        f'<button id="pdf" type="button" style="{btn_style}">📄 View PDF</button>'
+        if pdf_available
+        else f'<span style="{disabled_style}">📄 PDF unavailable</span>'
+    )
+
     html = f"""
-    <div style="margin:2px 0 0 0">
-      <button id="cp" type="button" style="
-        background: transparent;
-        border: 1px solid rgba(128,128,128,0.25);
-        border-radius: 6px;
-        padding: 3px 10px;
-        font-size: 12px;
-        cursor: pointer;
-        color: rgba(140,140,140,1);
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      ">📋 Copy</button>
+    <div style="display:flex;gap:6px;margin:2px 0 0 0">
+      <button id="cp" type="button" style="{btn_style}">📋 Copy</button>
+      {pdf_html}
     </div>
     <script>
-      const TEXT = {payload};
-      const btn = document.getElementById("cp");
-      btn.addEventListener("click", () => {{
+      const TEXT = {text_js};
+      const PDF_B64 = {pdf_js};
+      const FILENAME = {filename_js};
+
+      // ---- Copy ----
+      const cp = document.getElementById("cp");
+      cp.addEventListener("click", () => {{
         const flash = (ok) => {{
-          const orig = btn.innerText;
-          btn.innerText = ok ? "✓ Copied" : "× Failed";
-          setTimeout(() => {{ btn.innerText = orig; }}, 1500);
+          const orig = cp.innerText;
+          cp.innerText = ok ? "✓ Copied" : "× Failed";
+          setTimeout(() => {{ cp.innerText = orig; }}, 1500);
         }};
         const fallback = () => {{
           const ta = document.createElement("textarea");
@@ -485,9 +494,40 @@ def render_copy_button(text: str) -> None:
           fallback();
         }}
       }});
+
+      // ---- View PDF ----
+      const pdfBtn = document.getElementById("pdf");
+      if (pdfBtn) {{
+        pdfBtn.addEventListener("click", () => {{
+          try {{
+            const bytes = Uint8Array.from(atob(PDF_B64), c => c.charCodeAt(0));
+            const blob = new Blob([bytes], {{type: "application/pdf"}});
+            const url = URL.createObjectURL(blob);
+            const win = window.open(url, "_blank", "noopener");
+            if (!win) {{
+              // Popup blocked — fall back to triggering a download so the
+              // user at least gets the file.
+              const a = document.createElement("a");
+              a.href = url;
+              a.download = FILENAME;
+              a.style.display = "none";
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+            }}
+            // Give the new tab time to load before revoking the blob URL.
+            setTimeout(() => URL.revokeObjectURL(url), 60_000);
+          }} catch (e) {{
+            console.error("PDF open failed:", e);
+            const orig = pdfBtn.innerText;
+            pdfBtn.innerText = "× Failed";
+            setTimeout(() => {{ pdfBtn.innerText = orig; }}, 2000);
+          }}
+        }});
+      }}
     </script>
     """
-    components.html(html, height=32)
+    components.html(html, height=40)
 
 
 def render_chat_history() -> None:
