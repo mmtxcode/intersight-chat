@@ -43,6 +43,11 @@ services:
       OLLAMA_TAGS_URL: http://ollama:11434/api/tags
       OLLAMA_API_KEY: ollama
       INTERSIGHT_BASE_URL: ${INTERSIGHT_BASE_URL:-https://intersight.com}
+      # Preferred model to pre-select in the sidebar on first page load.
+      # Override per environment in .env (e.g. DEFAULT_MODEL=qwen2.5:14b
+      # for smaller GPUs). The app falls back to the first installed
+      # model if this one isn't pulled.
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-qwen2.5:32b}
     restart: unless-stopped
 
 volumes:

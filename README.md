@@ -73,9 +73,10 @@ make up-gpu
 # (equivalent: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build)
 
 # Pull a tool-calling-capable model into the Ollama container (one-time).
-# qwen2.5:14b is the recommended default — strong tool-call discipline,
-# fits comfortably on a single L40S / A100 / RTX 6000 Ada / H100.
-make pull-model MODEL=qwen2.5:14b
+# qwen2.5:32b is the recommended default for L40S-class GPUs — noticeably
+# better tool-call discipline than 14b, fits comfortably in ~22 GB VRAM.
+# Override with MODEL= for smaller GPUs (e.g. MODEL=qwen2.5:14b).
+make pull-model
 
 # Open the UI
 xdg-open http://<server>:8501
@@ -99,10 +100,14 @@ questions but slower and more VRAM.
 | Model | VRAM (approx) | When to pick |
 |---|---|---|
 | `qwen2.5:7b` | ~6 GB | Quick experiments, smaller GPUs |
-| `qwen2.5:14b` | ~10 GB | **Default for most demos** — best price/perf |
-| `qwen2.5:32b` | ~22 GB | When you want noticeably stronger reasoning |
-| `qwen2.5:72b` | ~48 GB | Top tier, needs a beefy GPU (L40S/H100) |
+| `qwen2.5:14b` | ~10 GB | Fine on smaller GPUs; weaker tool-call discipline than 32b |
+| `qwen2.5:32b` | ~22 GB | **Default for L40S-class GPUs** — best chat quality / tool-call discipline |
+| `qwen2.5:72b` | ~48 GB | Top tier, needs a full L40S / H100 |
 | `llama3.1:70b` | ~42 GB | Alternative to qwen2.5:72b |
+
+The sidebar pre-selects `qwen2.5:32b` if it's installed; override the
+preferred default via the `DEFAULT_MODEL` env var in `.env` or
+`docker-compose.yml` (e.g. `DEFAULT_MODEL=qwen2.5:14b` for smaller GPUs).
 
 Avoid `llama3.1:8b` — it's notably weak at multi-step tool use and tends
 to print tool calls as text instead of issuing them properly.

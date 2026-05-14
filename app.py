@@ -32,6 +32,10 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "ollama")
 OLLAMA_TAGS_URL = os.environ.get("OLLAMA_TAGS_URL", "http://localhost:11434/api/tags")
 INTERSIGHT_BASE_URL = os.environ.get("INTERSIGHT_BASE_URL", "https://intersight.com")
+# Preferred model to pre-select in the sidebar dropdown on first load. Falls
+# back to the first installed model if this one isn't pulled. Override per
+# deploy via the DEFAULT_MODEL env var in docker-compose.yml or .env.
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "qwen2.5:32b")
 
 st.set_page_config(
     page_title="Intersight Chat",
@@ -179,11 +183,16 @@ def render_sidebar() -> None:
         if err:
             st.error(err)
         if models:
-            default_idx = (
-                models.index(ss.selected_model)
-                if ss.selected_model in models
-                else 0
-            )
+            # Priority for the dropdown's initial selection:
+            #   1. Whatever the user already picked this session.
+            #   2. DEFAULT_MODEL env var (qwen2.5:32b by default), if pulled.
+            #   3. The first installed model.
+            if ss.selected_model in models:
+                default_idx = models.index(ss.selected_model)
+            elif DEFAULT_MODEL in models:
+                default_idx = models.index(DEFAULT_MODEL)
+            else:
+                default_idx = 0
             chosen = st.selectbox(
                 "Local model (Ollama)",
                 models,

@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 COMPOSE ?= docker compose
-MODEL ?= qwen2.5:14b
+MODEL ?= qwen2.5:32b
 
 .PHONY: up up-gpu down restart logs ps build pull-model shell-app shell-ollama clean
 
