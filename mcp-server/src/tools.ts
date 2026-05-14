@@ -494,4 +494,45 @@ export const tools: ToolDefinition[] = [
   },
 ];
 
+// ---------------------------------------------------------------- list_tools
+//
+// Pushed onto `tools` after the array is declared so the handler can close
+// over `tools` (referencing it inside an array literal at module top-level
+// would hit a TDZ). Exposed to the model so it can answer "what tools do
+// you have?" by calling a function rather than enumerating from memory —
+// smaller models tend to truncate self-described tool lists, and the
+// missing entries can mislead users about what the app can do.
+
+const HIDDEN_FROM_LISTING = new Set([
+  // configure_credentials is host-only (the Streamlit sidebar wires it).
+  // It's already hidden from the model in orchestrator.py's HIDDEN_TOOLS;
+  // exclude it here too so list_tools output matches the model's actual
+  // tool surface.
+  "configure_credentials",
+]);
+
+tools.push({
+  name: "list_tools",
+  description:
+    "Return the complete list of MCP tools available on this server, with " +
+    "each tool's name and description. ALWAYS call this tool when the user " +
+    "asks what tools, commands, capabilities, MCPs, or functions you have — " +
+    "the result is the authoritative list. Do not summarize from memory; " +
+    "always call this tool for these questions and render every entry.",
+  inputSchema: {
+    type: "object",
+    properties: {},
+    additionalProperties: false,
+  },
+  handler: async () => {
+    return {
+      ok: true,
+      count: tools.filter((t) => !HIDDEN_FROM_LISTING.has(t.name)).length,
+      tools: tools
+        .filter((t) => !HIDDEN_FROM_LISTING.has(t.name))
+        .map((t) => ({ name: t.name, description: t.description })),
+    };
+  },
+});
+
 export const toolMap = new Map(tools.map((t) => [t.name, t]));
