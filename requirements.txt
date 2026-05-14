@@ -9,3 +9,7 @@ python-dotenv>=1.0.0
 # requires gcc + libcairo2-dev to build — not worth the image bloat.
 markdown>=3.5
 fpdf2>=2.7.9
+# Reference-document RAG (sidebar "Attach a document" uploader): pure-Python
+# extractors for PDF and DOCX. .txt / .md need no extra deps.
+pypdf>=4.0
+python-docx>=1.1

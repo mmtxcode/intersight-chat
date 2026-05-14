@@ -81,6 +81,66 @@ def fetch_ollama_models() -> tuple[list[str], str | None]:
         return [], f"Failed to list Ollama models: {exc}"
 
 
+# ---------------------------------------------------------------- reference doc helpers
+
+# Soft ceiling on how much document text we'll stuff into context. The default
+# context window for qwen2.5:32b in Ollama is 32K tokens. With the system
+# prompt (~1.5K), tool-call rounds, the chat history, and a buffer for the
+# model's reply, ~20K tokens of reference material is a reasonable cap. ~4
+# chars per token gives ~80 KB of plain text — plenty for a datasheet or
+# release-notes excerpt, not enough for a whole reference manual.
+MAX_DOC_TOKENS = 20_000
+_CHARS_PER_TOKEN = 4  # rough English-text approximation, good enough for sizing
+
+
+def extract_text_from_uploaded_file(uploaded_file: Any) -> tuple[str, str | None]:
+    """Pull plain text out of a Streamlit UploadedFile.
+
+    Returns (text, error). On success error is None. On failure text is "" and
+    error is a short human-readable string for the UI. Supports .pdf, .docx,
+    .txt, .md. PDF extraction uses pypdf (pure-Python); DOCX uses python-docx
+    (pure-Python). Both are pip-only with no system libraries.
+
+    Note: scanned PDFs that have no embedded text layer will yield an empty
+    string. We surface that as an error so the user knows OCR would be needed.
+    """
+    import io as _io
+
+    name = uploaded_file.name.lower()
+    data = uploaded_file.getvalue()
+
+    if name.endswith((".txt", ".md")):
+        try:
+            return data.decode("utf-8", errors="replace"), None
+        except Exception as exc:  # noqa: BLE001
+            return "", f"Could not decode text file: {exc}"
+
+    if name.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(_io.BytesIO(data))
+            pages = [(p.extract_text() or "") for p in reader.pages]
+            text = "\n\n".join(pages).strip()
+            if not text:
+                return "", (
+                    "PDF has no extractable text — likely a scanned image. "
+                    "OCR isn't supported here; convert to text first."
+                )
+            return text, None
+        except Exception as exc:  # noqa: BLE001
+            return "", f"Could not read PDF: {exc}"
+
+    if name.endswith(".docx"):
+        try:
+            from docx import Document
+            doc = Document(_io.BytesIO(data))
+            return "\n".join(p.text for p in doc.paragraphs).strip(), None
+        except Exception as exc:  # noqa: BLE001
+            return "", f"Could not read DOCX: {exc}"
+
+    return "", f"Unsupported file type: {uploaded_file.name}"
+
+
 # ---------------------------------------------------------------- session state
 
 def init_state() -> None:
@@ -96,6 +156,11 @@ def init_state() -> None:
     ss.setdefault("connection_status", None)
     ss.setdefault("mask_key_id", True)
     ss.setdefault("warmed_model", None)
+    # Reference documents the user has attached for this conversation. Each
+    # entry: {"name": filename, "tokens": int}. The actual document text
+    # lives inside ss.messages as user/assistant primer pairs (see
+    # extract_text_from_uploaded_file + the sidebar attachment handler).
+    ss.setdefault("attached_docs", [])
 
 
 # ---------------------------------------------------------------- model pre-warm
@@ -213,6 +278,7 @@ def render_sidebar() -> None:
                 if col_a.button("Clear & switch", use_container_width=True):
                     ss.messages = []
                     ss.display = []
+                    ss.attached_docs = []
                     ss.selected_model = ss.model_switch_pending
                     ss.model_switch_pending = None
                     st.rerun()
@@ -266,9 +332,87 @@ def render_sidebar() -> None:
 
         st.divider()
 
+        # ---------- Reference documents (optional RAG-lite) ----------
+        st.markdown("### 5. Reference Documents (optional)")
+        st.caption(
+            "Attach a file to query against — datasheets, runbooks, release "
+            "notes, etc. Supported: PDF, DOCX, TXT, MD. Soft cap "
+            f"~{MAX_DOC_TOKENS // 1000}K tokens per file."
+        )
+        uploaded_doc = st.file_uploader(
+            "Attach a document",
+            type=["pdf", "txt", "md", "docx"],
+            accept_multiple_files=False,
+            key="doc_uploader",
+            label_visibility="collapsed",
+        )
+        if uploaded_doc is not None:
+            already_attached = {d["name"] for d in ss.attached_docs}
+            if uploaded_doc.name in already_attached:
+                # Streamlit's file_uploader keeps returning the same file on
+                # every rerun until the user clears the widget. The name-set
+                # dedup makes attaching idempotent — we process each file
+                # exactly once per session.
+                pass
+            else:
+                with st.spinner(f"Reading {uploaded_doc.name}…"):
+                    text, err = extract_text_from_uploaded_file(uploaded_doc)
+                if err:
+                    st.error(err)
+                else:
+                    token_estimate = max(1, len(text) // _CHARS_PER_TOKEN)
+                    if token_estimate > MAX_DOC_TOKENS:
+                        st.error(
+                            f"File is ~{token_estimate:,} tokens, exceeds the "
+                            f"{MAX_DOC_TOKENS:,}-token cap. Trim it or split "
+                            "into smaller files."
+                        )
+                    else:
+                        # Inject as a user/assistant primer pair into the
+                        # model history. The orchestrator will see this on
+                        # every subsequent turn, so the file is "in context"
+                        # for the rest of the conversation without us having
+                        # to re-prepend it each turn.
+                        ss.messages.append({
+                            "role": "user",
+                            "content": (
+                                f"I'm attaching a reference document — treat its "
+                                f"contents as authoritative when relevant to my "
+                                f"questions. Do NOT call Intersight tools to "
+                                f"look up information that's already in this "
+                                f"document.\n\n"
+                                f"[BEGIN DOCUMENT: {uploaded_doc.name}]\n"
+                                f"{text}\n"
+                                f"[END DOCUMENT: {uploaded_doc.name}]"
+                            ),
+                        })
+                        ss.messages.append({
+                            "role": "assistant",
+                            "content": (
+                                f"Got it — {uploaded_doc.name} is loaded. "
+                                "I'll reference it when relevant."
+                            ),
+                        })
+                        ss.attached_docs.append({
+                            "name": uploaded_doc.name,
+                            "tokens": token_estimate,
+                        })
+                        st.toast(
+                            f"📎 Attached {uploaded_doc.name} "
+                            f"(~{token_estimate:,} tokens)",
+                            icon="✅",
+                        )
+        if ss.attached_docs:
+            st.markdown("**Attached:**")
+            for d in ss.attached_docs:
+                st.caption(f"📎 {d['name']} (~{d['tokens']:,} tokens)")
+
+        st.divider()
+
         if st.button("Clear conversation", use_container_width=True):
             ss.messages = []
             ss.display = []
+            ss.attached_docs = []
             st.rerun()
 
 
